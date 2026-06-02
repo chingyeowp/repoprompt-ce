@@ -44,9 +44,70 @@ jobs:
           echo "commit=$(./Scripts/verify_release_ref.sh "$RELEASE_TAG")" >> "$GITHUB_OUTPUT"
           echo "tooling-commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
+  smoke-reviewed-helper:
+    name: Smoke Reviewed Helper Without Release Secrets
+    needs: validate-ref
+    if: github.ref == 'refs/heads/main'
+    runs-on: macos-26
+    permissions:
+      contents: read
+    steps:
+      - name: Check out trusted release tooling
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ needs.validate-ref.outputs.tooling-commit }}
+          path: trusted-control-plane
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download reviewed ZIP and checksum manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          SOURCE_GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          mkdir reviewed-assets
+          gh release download "$RELEASE_TAG" \
+            --repo "$SOURCE_GITHUB_REPOSITORY" \
+            --dir reviewed-assets \
+            --pattern '*.zip' \
+            --pattern SHA256SUMS
+
+      - name: Verify reviewed ZIP checksum binding
+        env:
+          REVIEWED_CHECKSUMS_SHA256: ${{ inputs.reviewed_checksums_sha256 }}
+        run: |
+          set -euo pipefail
+          checksums=reviewed-assets/SHA256SUMS
+          actual_digest="$(shasum -a 256 "$checksums" | awk '{ print $1 }')"
+          [[ "$actual_digest" == "$REVIEWED_CHECKSUMS_SHA256" ]] || { echo "Reviewed SHA256SUMS digest mismatch" >&2; exit 1; }
+          shopt -s nullglob
+          archives=(reviewed-assets/*.zip)
+          [[ "${#archives[@]}" == "1" ]] || { echo "Expected exactly one reviewed ZIP" >&2; exit 1; }
+          grep -F "  $(basename "${archives[0]}")" "$checksums" > reviewed-assets/reviewed-zip.sha256
+          [[ "$(wc -l < reviewed-assets/reviewed-zip.sha256 | tr -d ' ')" == "1" ]] || { echo "Reviewed ZIP checksum entry mismatch" >&2; exit 1; }
+          (cd reviewed-assets && shasum -a 256 -c reviewed-zip.sha256)
+          mkdir extracted
+          ditto -x -k "${archives[0]}" extracted
+          ./trusted-control-plane/Scripts/validate_embedded_mcp_helper_layout.sh \
+            extracted/RepoPrompt.app \
+            "Reviewed ZIP MCP helper layout"
+
+      - name: Execute reviewed helper without inherited secrets
+        run: |
+          env -i \
+            PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+            HOME="$HOME" \
+            TMPDIR="$RUNNER_TEMP" \
+            ./trusted-control-plane/Scripts/smoke_embedded_mcp_helper.sh \
+            extracted/RepoPrompt.app \
+            "Reviewed ZIP MCP helper"
+
   promote:
     name: Mirror and Promote Reviewed Draft
-    needs: validate-ref
+    needs:
+      - validate-ref
+      - smoke-reviewed-helper
     if: github.ref == 'refs/heads/main'
     environment: release
     runs-on: macos-26

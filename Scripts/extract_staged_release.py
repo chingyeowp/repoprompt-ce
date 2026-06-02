@@ -50,13 +50,13 @@ def normalized_link_target(member: PurePosixPath, target: str) -> PurePosixPath:
 def allowed_symlink(member: PurePosixPath, target: str, app_name: str) -> bool:
     app = PurePosixPath(".build", "release", f"{app_name}.app")
     cli_links = {
-        app / "Contents" / "Resources" / "repoprompt-mcp",
-        app / "Contents" / "Resources" / "bin" / "repoprompt-mcp",
+        app / "Contents" / "Resources" / "repoprompt-mcp": "../MacOS/repoprompt-mcp",
+        app / "Contents" / "Resources" / "bin" / "repoprompt-mcp": "../../MacOS/repoprompt-mcp",
     }
     sparkle = app / "Contents" / "Frameworks" / "Sparkle.framework"
-    resolved = normalized_link_target(member, target)
     if member in cli_links:
-        return confined(app, resolved)
+        return target == cli_links[member]
+    resolved = normalized_link_target(member, target)
     return confined(sparkle, member) and confined(sparkle, resolved)
 
 

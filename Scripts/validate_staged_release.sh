@@ -81,18 +81,17 @@ if top_level != expected_top_level:
     fail(f"unexpected staged top-level entries: {sorted(top_level ^ expected_top_level)}")
 
 cli_links = {
-    app / "Contents" / "Resources" / "repoprompt-mcp",
-    app / "Contents" / "Resources" / "bin" / "repoprompt-mcp",
+    app / "Contents" / "Resources" / "repoprompt-mcp": "../MacOS/repoprompt-mcp",
+    app / "Contents" / "Resources" / "bin" / "repoprompt-mcp": "../../MacOS/repoprompt-mcp",
 }
 sparkle = app / "Contents" / "Frameworks" / "Sparkle.framework"
-resolved_app = app.resolve(strict=False)
 resolved_sparkle = sparkle.resolve(strict=False)
 for path in root.rglob("*"):
     mode = path.lstat().st_mode
     if stat.S_ISLNK(mode):
         resolved = path.resolve(strict=False)
         allowed = (
-            path in cli_links and resolved.is_relative_to(resolved_app)
+            path in cli_links and os.readlink(path) == cli_links[path]
         ) or (
             sparkle in path.parents and resolved.is_relative_to(resolved_sparkle)
         )
@@ -101,6 +100,8 @@ for path in root.rglob("*"):
     elif not stat.S_ISDIR(mode) and not stat.S_ISREG(mode):
         fail(f"unsupported staged path type: {path}")
 PYTHON
+
+"$SCRIPT_DIR/validate_embedded_mcp_helper_layout.sh" "$APP_BUNDLE" "Staged app MCP helper layout"
 
 [[ "$(cat "$ROOT_DIR/RELEASE_COMMIT")" == "$RELEASE_COMMIT" ]] ||
     fail "Staged release commit does not match approved commit"

@@ -133,7 +133,7 @@ BUILD_DIR="$(swift build -c release --show-bin-path)"
 SOURCE_APP="$BUILD_DIR/$APP_NAME.app"
 [[ -d "$SOURCE_APP" ]] || fail "Missing packaged local production app: $SOURCE_APP"
 [[ "$(plutil -extract RepoPromptSigningMode raw "$SOURCE_APP/Contents/Info.plist")" == "local-self-signed" ]] ||
-    fail "Packaged app is missing the local self-signed runtime marker."
+    fail "Packaged app is missing the local self-signed signing-mode marker."
 codesign --verify --deep --strict --verbose=2 "$SOURCE_APP"
 codesign --verify --deep --strict --verbose=2 -R="$LOCAL_SIGNING_REQUIREMENT" "$SOURCE_APP"
 

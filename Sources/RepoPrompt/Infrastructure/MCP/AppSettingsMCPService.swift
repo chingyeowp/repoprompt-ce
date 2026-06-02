@@ -788,7 +788,7 @@ private enum AppSettingsMCPRegistry {
             key: "agent_mode.codex_goal_support_enabled",
             group: "agent_mode",
             label: "Codex Goal Support",
-            description: "Opt-in toggle for Codex /goal support. When enabled, RepoPrompt passes features.goals=true to Codex app-server launch and thread start/resume config.",
+            description: "Default-on toggle for Codex /goal support. Turn off to prevent RepoPrompt from passing features.goals=true to Codex app-server launch and thread start/resume config.",
             read: { .bool($0.codexGoalSupportEnabled()) },
             write: { try $0.setCodexGoalSupportEnabled(requiredBool(from: $1)) }
         ),

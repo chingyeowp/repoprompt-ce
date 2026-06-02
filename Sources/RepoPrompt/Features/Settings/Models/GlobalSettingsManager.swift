@@ -902,7 +902,7 @@ class GlobalSettingsStore: ObservableObject {
     }
 
     func codexGoalSupportEnabled() -> Bool {
-        CodexGoalSupport.isEnabled(persistedValue: scalarPreferences.agentMode?.codexGoalSupportEnabled ?? false)
+        CodexGoalSupport.isEnabled(persistedValue: scalarPreferences.agentMode?.codexGoalSupportEnabled)
     }
 
     func setCodexGoalSupportEnabled(_ enabled: Bool, commit: Bool = true) {

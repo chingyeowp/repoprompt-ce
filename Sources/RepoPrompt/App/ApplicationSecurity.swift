@@ -17,9 +17,7 @@ class ApplicationSecurity {
     private static let shared = ApplicationSecurity()
     private let stateQueue = DispatchQueue(label: "com.repoprompt.security.state")
     private let stateQueueKey = DispatchSpecificKey<Void>()
-    private let verificationQueue = DispatchQueue(label: "com.repoprompt.security.bundle-verification", qos: .utility)
     private var didStartMonitoring = false
-    private var lastBundleVerificationContinuous: Double?
 
     private var didEnableAntiDebugging = false
     private var didLogMainThreadSync = false
@@ -64,7 +62,7 @@ class ApplicationSecurity {
         #endif
     }
 
-    /// Enable anti-debug attachment hardening (ptrace) after bundle verification.
+    /// Enable anti-debug attachment hardening (ptrace).
     static func enableAntiDebugging() {
         #if !DEBUG
             _ = shared
@@ -93,8 +91,8 @@ class ApplicationSecurity {
         guard !didStartMonitoring else { return }
         didStartMonitoring = true
 
-        // Schedule initial check asynchronously to avoid blocking MainActor.
-        // This prevents UI hangs during app launch if bundle verification is slow.
+        // Schedule initial environmental check asynchronously to avoid blocking MainActor.
+        // This keeps launch-time monitoring work off the main thread.
         stateQueue.async { [weak self] in
             self?.performIntegrityCheck()
         }
@@ -154,9 +152,6 @@ class ApplicationSecurity {
                 } else {
                     clearSoftRestrictionsIfNeeded()
                 }
-
-                // Bundle signature checks (periodic, off stateQueue)
-                scheduleBundleVerificationIfNeeded()
             }
         #endif
     }
@@ -235,36 +230,6 @@ class ApplicationSecurity {
             }
         }
         return false
-    }
-
-    // MARK: - Bundle Verification
-
-    private let bundleVerificationMinInterval: TimeInterval = 1800 // 30 minutes
-
-    private func scheduleBundleVerificationIfNeeded() {
-        let nowContinuous = MonotonicClock.continuousSeconds()
-        if let last = lastBundleVerificationContinuous,
-           nowContinuous - last < bundleVerificationMinInterval
-        {
-            return
-        }
-        lastBundleVerificationContinuous = nowContinuous
-        verificationQueue.async { [weak self] in
-            guard let self else { return }
-            let isValid: Bool
-            do {
-                try BundleVerifier.verifyBundleSignature()
-                isValid = true
-            } catch {
-                isValid = false
-            }
-            guard isValid else {
-                stateQueue.async {
-                    self.exitForSecurityViolation()
-                }
-                return
-            }
-        }
     }
 
     private func withStateQueue<T>(_ body: () -> T) -> T {

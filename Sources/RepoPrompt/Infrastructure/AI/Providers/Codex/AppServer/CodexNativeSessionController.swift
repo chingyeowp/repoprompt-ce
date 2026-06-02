@@ -277,7 +277,6 @@ final class CodexNativeSessionController {
         var authTokensRefreshHandler: ChatgptAuthTokensRefreshHandler?
         var goalSupportEnabledProvider: @MainActor () -> Bool = { false }
         var computerUseEnabledProvider: @MainActor () -> Bool = { false }
-        var startNewThreadsEphemerally: Bool = false
 
         static func agentModeDefault(
             forceExperimentalSteering: Bool,
@@ -285,7 +284,7 @@ final class CodexNativeSessionController {
             sandboxModeProvider: @escaping () -> CodexAgentToolPreferences.SandboxMode = { CodexAgentToolPreferences.sandboxMode() },
             approvalReviewerProvider: @escaping () -> CodexAgentToolPreferences.ApprovalReviewer = { CodexAgentToolPreferences.approvalReviewer() },
             shellToolEnabled: Bool? = nil,
-            goalSupportEnabledProvider: @escaping @MainActor () -> Bool = { false },
+            goalSupportEnabledProvider: @escaping @MainActor () -> Bool = { CodexGoalSupport.isEnabled },
             computerUseEnabledProvider: @escaping @MainActor () -> Bool = { false }
         ) -> Options {
             Options(
@@ -312,8 +311,7 @@ final class CodexNativeSessionController {
                 approvalReviewerProvider: approvalReviewerProvider,
                 authTokensRefreshHandler: nil,
                 goalSupportEnabledProvider: goalSupportEnabledProvider,
-                computerUseEnabledProvider: computerUseEnabledProvider,
-                startNewThreadsEphemerally: false
+                computerUseEnabledProvider: computerUseEnabledProvider
             )
         }
     }
@@ -871,9 +869,6 @@ final class CodexNativeSessionController {
                 }
                 if !baseInstructions.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     params["baseInstructions"] = baseInstructions
-                }
-                if options.startNewThreadsEphemerally {
-                    params["ephemeral"] = true
                 }
                 result = try await requestWithCompatibleAppServerRequestValueStyle(
                     method: "thread/start",

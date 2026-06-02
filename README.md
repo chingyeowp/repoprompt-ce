@@ -60,9 +60,9 @@ Apple Development signing path.
 
 ### Install a local production build
 
-For a release-mode app under `/Applications`, double-click
+For a release-mode app under `/Applications`, install Python 3 and double-click
 [`Install RepoPrompt CE Local Production.command`](Install%20RepoPrompt%20CE%20Local%20Production.command)
-in Finder.
+in Finder. The Finder launcher uses the coordinated developer daemon.
 
 The installer builds RepoPrompt CE from source and replaces any existing
 `/Applications/RepoPrompt CE.app` using a dedicated self-signed certificate

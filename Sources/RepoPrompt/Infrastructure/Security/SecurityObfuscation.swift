@@ -16,17 +16,6 @@ enum SecurityObfuscation {
         return String(bytes: decoded, encoding: .utf8) ?? ""
     }
 
-    // MARK: - BundleVerifier Keys
-
-    static let expectedBundleIdentifierEncoded: [UInt8] = [
-        57, 53, 55, 116, 42, 44, 52, 57, 50, 63, 40, 116, 40, 63, 42,
-        53, 42, 40, 53, 55, 42, 46, 116, 57, 63
-    ]
-
-    static let expectedTeamIdentifierEncoded: [UInt8] = [
-        108, 110, 98, 27, 104, 109, 23, 9, 14, 111
-    ]
-
     // MARK: - Agent Permission Secure Store Keys
 
     static let agentPermissionSubagentDocumentKeyEncoded: [UInt8] = [

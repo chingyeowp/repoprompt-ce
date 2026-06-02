@@ -18,9 +18,9 @@ make dev-release-artifact
 ```
 
 For a local-only release-mode installation signed by the user's own dedicated
-self-signed identity, double-click
+self-signed identity, install Python 3 and double-click
 [`Install RepoPrompt CE Local Production.command`](../../../Install%20RepoPrompt%20CE%20Local%20Production.command)
-in Finder or use:
+in Finder, or use the coordinated CLI path:
 
 ```bash
 CONFIRM_LOCAL_PRODUCTION_INSTALL=1 make dev-install-local-production

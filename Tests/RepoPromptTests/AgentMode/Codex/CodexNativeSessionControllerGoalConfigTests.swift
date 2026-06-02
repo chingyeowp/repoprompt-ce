@@ -2,7 +2,7 @@ import Foundation
 @testable import RepoPrompt
 import XCTest
 
-final class CodexNativeSessionControllerThreadStartTests: XCTestCase {
+final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
     private var temporaryDirectories: [URL] = []
 
     override func tearDownWithError() throws {
@@ -13,61 +13,86 @@ final class CodexNativeSessionControllerThreadStartTests: XCTestCase {
         try super.tearDownWithError()
     }
 
-    func testFreshThreadStartEphemeralJSONRPCShapeMatrix() async throws {
-        let rows: [(label: String, options: CodexNativeSessionController.Options?, instructions: String, expectedEphemeral: Bool?)] = [
-            ("opted-in standard chat", makeStandardChatOptions(startNewThreadsEphemerally: true), "Oracle", true),
-            ("default standard chat", makeStandardChatOptions(startNewThreadsEphemerally: false), "Chat", nil),
-            ("Agent Mode default", nil, "Agent", nil)
-        ]
+    func testAgentModeDefaultCarriesGoalFeatureConfigToStartAndResume() async throws {
+        let options = CodexNativeSessionController.Options.agentModeDefault(
+            forceExperimentalSteering: false,
+            approvalPolicyProvider: { .never },
+            sandboxModeProvider: { .readOnly },
+            approvalReviewerProvider: { .user }
+        )
 
-        for row in rows {
-            let (controller, recordURL) = try await makeController(options: row.options)
-
-            _ = try await controller.startOrResume(existing: nil, baseInstructions: row.instructions)
-            await controller.shutdown()
-
-            let params = try recordedParams(for: "thread/start", at: recordURL)
-            if let expectedEphemeral = row.expectedEphemeral {
-                XCTAssertEqual(params["ephemeral"] as? Bool, expectedEphemeral, row.label)
-            } else {
-                XCTAssertNil(params["ephemeral"], row.label)
-            }
-        }
+        try await assertStartAndResumeGoalConfig(
+            options: options,
+            expectedGoalSupportEnabled: true
+        )
     }
 
-    func testResumeNeverIncludesEphemeralWhenFreshStartsAreOptedIn() async throws {
-        let (controller, recordURL) = try await makeController(options: makeStandardChatOptions(startNewThreadsEphemerally: true))
+    func testAgentModeDefaultCarriesExplicitGoalOptOutToStartAndResume() async throws {
+        let options = CodexNativeSessionController.Options.agentModeDefault(
+            forceExperimentalSteering: false,
+            approvalPolicyProvider: { .never },
+            sandboxModeProvider: { .readOnly },
+            approvalReviewerProvider: { .user },
+            goalSupportEnabledProvider: { false }
+        )
+
+        try await assertStartAndResumeGoalConfig(
+            options: options,
+            expectedGoalSupportEnabled: false
+        )
+    }
+
+    func testAgentModeDefaultCarriesExplicitGoalOptInToStartAndResume() async throws {
+        let options = CodexNativeSessionController.Options.agentModeDefault(
+            forceExperimentalSteering: false,
+            approvalPolicyProvider: { .never },
+            sandboxModeProvider: { .readOnly },
+            approvalReviewerProvider: { .user },
+            goalSupportEnabledProvider: { true }
+        )
+
+        try await assertStartAndResumeGoalConfig(
+            options: options,
+            expectedGoalSupportEnabled: true
+        )
+    }
+
+    private func assertStartAndResumeGoalConfig(
+        options: CodexNativeSessionController.Options,
+        expectedGoalSupportEnabled: Bool
+    ) async throws {
+        let (startController, startRecordURL) = try await makeController(options: options)
+        _ = try await startController.startOrResume(existing: nil, baseInstructions: "Agent")
+        await startController.shutdown()
+
+        try assertGoalFeatureAndComputerUseConfig(
+            in: recordedParams(for: "thread/start", at: startRecordURL),
+            expectedGoalSupportEnabled: expectedGoalSupportEnabled,
+            label: "thread/start"
+        )
+
+        let (resumeController, resumeRecordURL) = try await makeController(options: options)
         let existing = CodexNativeSessionController.SessionRef(
             conversationID: "existing-thread",
             rolloutPath: nil,
             model: nil,
             reasoningEffort: nil
         )
+        _ = try await resumeController.startOrResume(existing: existing, baseInstructions: "Agent")
+        await resumeController.shutdown()
 
-        _ = try await controller.startOrResume(existing: existing, baseInstructions: "Oracle")
-        await controller.shutdown()
-
-        let params = try recordedParams(for: "thread/resume", at: recordURL)
-        XCTAssertNil(params["ephemeral"])
-    }
-
-    private func makeStandardChatOptions(startNewThreadsEphemerally: Bool) -> CodexNativeSessionController.Options {
-        CodexNativeSessionController.Options(
-            requestTimeout: 5,
-            configOverridesProvider: { [:] },
-            approvalPolicyProvider: { .never },
-            sandboxModeProvider: { .readOnly },
-            approvalReviewerProvider: { .user },
-            authTokensRefreshHandler: nil,
-            startNewThreadsEphemerally: startNewThreadsEphemerally
+        try assertGoalFeatureAndComputerUseConfig(
+            in: recordedParams(for: "thread/resume", at: resumeRecordURL),
+            expectedGoalSupportEnabled: expectedGoalSupportEnabled,
+            label: "thread/resume"
         )
     }
 
     private func makeController(
-        options: CodexNativeSessionController.Options?
+        options: CodexNativeSessionController.Options
     ) async throws -> (CodexNativeSessionController, URL) {
         let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("CodexNativeSessionControllerThreadStartTests-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("CodexNativeSessionControllerGoalConfigTests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         temporaryDirectories.append(directory)
 
@@ -142,5 +167,15 @@ final class CodexNativeSessionControllerThreadStartTests: XCTestCase {
         }
         XCTFail("No \(method) request was recorded")
         return [:]
+    }
+
+    private func assertGoalFeatureAndComputerUseConfig(
+        in params: [String: Any],
+        expectedGoalSupportEnabled: Bool,
+        label: String
+    ) throws {
+        let config = try XCTUnwrap(params["config"] as? [String: Any], label)
+        XCTAssertEqual(config["features.goals"] as? Bool, expectedGoalSupportEnabled, label)
+        XCTAssertEqual(config["features.computer_use"] as? Bool, false, label)
     }
 }

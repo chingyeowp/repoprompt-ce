@@ -108,40 +108,13 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
             }
             return
         #else
-            Task { [weak self] in
-                guard let self else { return }
+            sparkleManager.startUpdater()
 
-                // 0) Verify bundle signature integrity (every launch, no caching)
-                // NOTE: BundleVerificationService runs the heavy Security.framework call
-                // on a background executor to avoid blocking the main thread.
-                do {
-                    let verificationService = BundleVerificationService()
-                    let isValid = try await verificationService.verify()
+            ApplicationSecurity.startMonitoring()
+            ApplicationSecurity.enableAntiDebugging()
 
-                    guard isValid else {
-                        showSecurityViolationAlert(message: "Application integrity check failed. Please reinstall.")
-                        NSApplication.shared.terminate(nil)
-                        return
-                    }
-                } catch {
-                    print("Bundle verification failed: \(error)")
-                    showSecurityViolationAlert(message: "Application integrity check failed. Please reinstall.")
-                    NSApplication.shared.terminate(nil)
-                    return
-                }
-
-                // Only activate updates and proceed with security monitoring after verification succeeds
-                sparkleManager.startUpdater()
-
-                // 1) Security checks
-                ApplicationSecurity.startMonitoring()
-
-                ApplicationSecurity.enableAntiDebugging()
-
-                // 2) CLI symlink
-                Task {
-                    CLISymlinkManagerUserSpace.ensureLocalSymlink()
-                }
+            Task {
+                CLISymlinkManagerUserSpace.ensureLocalSymlink()
             }
         #endif
     }
@@ -202,14 +175,6 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         if !AppLaunchConfiguration.current.suppressesWindowPersistence {
             WindowStatesManager.shared.persistWindowSession(reason: "appWillTerminate")
         }
-    }
-
-    private func showSecurityViolationAlert(message: String) {
-        let alert = NSAlert()
-        alert.messageText = "Security Violation"
-        alert.informativeText = message
-        alert.addButton(withTitle: "Quit")
-        alert.runModal()
     }
 
     // MARK: - App Teardown

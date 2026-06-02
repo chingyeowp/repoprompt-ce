@@ -59,19 +59,19 @@ path on `main` and on manual dispatch, then uploads the archive as a workflow
 artifact.
 
 Contributors should not upload this artifact to GitHub Releases. It is useful
-for packaging inspection only; its ad-hoc signature intentionally does not pass
-the official release runtime integrity check. For runnable release-mode local
-testing, use the self-signed local production installer below.
+for packaging inspection only; it is not notarized or suitable for public
+distribution. For runnable release-mode local testing, use the self-signed local
+production installer below.
 
 ## Install a local self-signed production build
 
 Users who want a release-mode build without maintainer credentials can install
 a local-only production app by double-clicking
 [`Install RepoPrompt CE Local Production.command`](../Install%20RepoPrompt%20CE%20Local%20Production.command)
-in Finder. The launcher confirms replacement of any existing installed app,
-runs the coordinated developer daemon when Python 3 is available, and keeps
-the terminal window open so certificate approval prompts and build results
-remain visible.
+in Finder. The Finder launcher requires Python 3, confirms replacement of any
+existing installed app, runs the coordinated developer daemon, and keeps the
+terminal window open so certificate approval prompts and build results remain
+visible.
 
 The equivalent command-line path is:
 
@@ -94,10 +94,10 @@ to confirm the local certificate trust change when the identity is first
 created.
 
 This path is intentionally separate from public distribution. The resulting app
-is compiled with a local-only runtime verification mode, is not notarized, must
-not be uploaded to GitHub Releases, and should not be copied to another Mac.
-Official releases continue to require the CE Developer ID identity,
-provisioning profile, hardened runtime entitlements, notarization, and stapling.
+is self-signed, not notarized, must not be uploaded to GitHub Releases, and
+should not be copied to another Mac. Official releases continue to require the
+CE Developer ID identity, provisioning profile, hardened runtime entitlements,
+notarization, and stapling.
 
 ## Maintainer setup
 
@@ -182,7 +182,12 @@ replaces the staged Sparkle framework with the closed-world verified
 trusted-control-plane copy, renders hardened runtime entitlements from trusted
 policy, signs the staged bundle, notarizes and staples the app and DMG, creates a Sparkle appcast with the trusted
 `generate_appcast` binary, and uploads ZIP, DMG, appcast, and checksum assets to
-a draft GitHub Release. The draft notes embed the approved release-commit SHA.
+a draft GitHub Release. Privileged signing validates the embedded MCP helper
+layout statically and does not execute packaged helper code. After draft
+creation, a fresh runner without the protected `release` environment downloads
+the signed ZIP, repeats static layout validation, and runs the helper
+`--version` smoke under a minimal secret-free environment. The draft notes embed
+the approved release-commit SHA.
 Draft-only creation is intentional: **Promote Release** is the sole stable
 publication path. The appcast enclosure already points at the immutable,
 tag-specific public updater ZIP URL that promotion will populate.
@@ -254,7 +259,12 @@ shasum -a 256 SHA256SUMS
 ```
 
 Dispatch the environment-scoped **Promote Release** workflow from protected
-`main` with the same tag and that reviewed digest. It runs:
+`main` with the same tag and that reviewed digest. Before the protected
+promotion job starts, a fresh runner downloads the reviewed ZIP and checksum
+manifest with a narrowly scoped source token, verifies the reviewed digest and
+ZIP checksum, validates the helper layout statically, and runs the helper
+`--version` smoke under a minimal secret-free environment. The protected job
+then runs:
 
 ```bash
 ./Scripts/promote_release.sh promote
@@ -272,10 +282,12 @@ does not advance the current stable channel. Rollback protection treats an
 explicit GitHub `404` as the empty first-release state and fails closed on other
 API or network errors.
 
-After verification, it creates or resumes an updater draft with the reviewed
-ZIP, appcast, and checksums, publishes the updater release, publishes the source
-release, explicitly marks both as latest, and immediately verifies every source
-and updater asset anonymously. The workflow serializes stable-channel
+Protected promotion validates the ZIP and mounted DMG helper layouts statically;
+it does not execute packaged helper code while source and updater tokens or the
+Sparkle private key are available. After verification, it creates or resumes an
+updater draft with the reviewed ZIP, appcast, and checksums, publishes the
+updater release, publishes the source release, explicitly marks both as latest,
+and immediately verifies every source and updater asset anonymously. The workflow serializes stable-channel
 promotion so two CI promotions cannot race. Rerunning the same tag safely
 resumes expected partial states only when the existing assets match exactly.
 

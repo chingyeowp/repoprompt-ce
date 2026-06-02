@@ -30,7 +30,7 @@ run(){
 }
 fail(){ echo "ERROR: $*" >&2; exit 1; }
 finish(){
-    local status=$? now total
+    local status="$1" now total
     [[ -z "${APP_ENTITLEMENTS:-}" ]] || rm -f "$APP_ENTITLEMENTS"
     now="$(date +%s)"
     total=$((now - START_TIME))
@@ -41,7 +41,7 @@ finish(){
     fi
     exit "$status"
 }
-trap finish EXIT
+trap 'finish $?' EXIT
 
 BUNDLE_ID_OVERRIDE="${BUNDLE_ID:-}"
 source "$CONTROL_PLANE_SCRIPTS_DIR/load_release_metadata.sh"
@@ -151,9 +151,6 @@ printf 'Debug secure storage backend marker: %s\n' "$DEBUG_STORAGE_BACKEND_MARKE
 printf 'Signing mode marker: %s\n' "$SIGNING_MODE_MARKER"
 
 SWIFT_BUILD_ARGS=(-c "$CONF")
-if (( USE_LOCAL_SELF_SIGNED_RELEASE )); then
-    SWIFT_BUILD_ARGS+=(-Xswiftc -DREPOPROMPT_LOCAL_SELF_SIGNED_BUILD)
-fi
 
 phase "Building $APP_NAME ($CONF)"
 run "$RUN_WITHOUT_GITHUB_TOKENS" swift build "${SWIFT_BUILD_ARGS[@]}" --product "$APP_NAME"
@@ -263,6 +260,14 @@ sign_path(){
     fi
     run codesign "${args[@]}" "$@" "$path"
 }
+sign_sparkle_framework(){
+    local framework="$1"
+    sign_path "$framework/Versions/B/XPCServices/Installer.xpc"
+    sign_path "$framework/Versions/B/XPCServices/Downloader.xpc" --preserve-metadata=entitlements
+    sign_path "$framework/Versions/B/Autoupdate"
+    sign_path "$framework/Versions/B/Updater.app"
+    sign_path "$framework"
+}
 verify_signed_app_identity(){
     local details identifier team authorities
     details="$(codesign -dv --verbose=4 "$APP_BUNDLE" 2>&1 || true)"
@@ -288,16 +293,22 @@ verify_signed_app_identity(){
         [[ -n "$team" && "$team" != "not set" ]] || fail "Debug app was expected to be signed with a stable identity, but no team identifier was found."
     fi
 }
-if [[ -d "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework" ]]; then sign_path "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"; fi
+if [[ -d "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework" ]]; then sign_sparkle_framework "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"; fi
 sign_path "$APP_BUNDLE/Contents/MacOS/repoprompt-mcp"
 sign_path "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
-APP_SIGN_ARGS=(--deep)
+APP_SIGN_ARGS=()
 if (( IS_RELEASE )) && (( ! USE_ADHOC_SIGNING )); then
     APP_SIGN_ARGS+=(--entitlements "$APP_ENTITLEMENTS")
 fi
-sign_path "$APP_BUNDLE" "${APP_SIGN_ARGS[@]}"
+if (( ${#APP_SIGN_ARGS[@]} )); then
+    sign_path "$APP_BUNDLE" "${APP_SIGN_ARGS[@]}"
+else
+    sign_path "$APP_BUNDLE"
+fi
 run codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
 verify_signed_app_identity
+run "$CONTROL_PLANE_SCRIPTS_DIR/validate_embedded_mcp_helper_layout.sh" "$APP_BUNDLE" "Packaged app MCP helper layout"
+run "$RUN_WITHOUT_GITHUB_TOKENS" "$CONTROL_PLANE_SCRIPTS_DIR/smoke_embedded_mcp_helper.sh" "$APP_BUNDLE" "Packaged app MCP helper"
 if [[ "$(python3 - <<PY
 from pathlib import Path
 print(Path('$APP_BUNDLE').resolve(strict=False) == Path('$COMPAT_APP_BUNDLE').resolve(strict=False))

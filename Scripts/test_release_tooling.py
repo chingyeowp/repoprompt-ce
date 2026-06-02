@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import base64
 import os
+import plistlib
 import shutil
 import stat
 import subprocess
@@ -17,18 +18,230 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 
 class ReleaseToolingTests(unittest.TestCase):
-    def test_sparkle_start_is_deferred_until_release_bundle_verification(self) -> None:
+    def test_custom_packaging_resigns_sparkle_helpers_without_recursive_entitlement_propagation(self) -> None:
+        package_script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
+        staged_signing_script = (SCRIPT_DIR / "sign_staged_release.sh").read_text(encoding="utf-8")
+        info_plist = plistlib.loads((SCRIPT_DIR.parent / "AppBundle" / "Info.plist.template").read_bytes())
+
+        for script in (package_script, staged_signing_script):
+            self.assertIn('sign_path "$framework/Versions/B/XPCServices/Installer.xpc"', script)
+            self.assertIn(
+                'sign_path "$framework/Versions/B/XPCServices/Downloader.xpc" --preserve-metadata=entitlements',
+                script,
+            )
+            self.assertIn('sign_path "$framework/Versions/B/Autoupdate"', script)
+            self.assertIn('sign_path "$framework/Versions/B/Updater.app"', script)
+            self.assertIn('sign_path "$framework"', script)
+
+        self.assertIn('APP_SIGN_ARGS=()', package_script)
+        self.assertNotIn('APP_SIGN_ARGS=(--deep)', package_script)
+        self.assertNotIn('sign_path "$APP_BUNDLE" --deep', staged_signing_script)
+        self.assertNotIn("SUEnableInstallerLauncherService", info_plist)
+        self.assertIn("trap 'finish $?' EXIT", package_script)
+        self.assertIn('local status="$1" now total', package_script)
+
+    def test_release_paths_use_static_validation_in_privileged_contexts_and_token_stripped_local_smoke(self) -> None:
+        package_script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
+        staged_signing_script = (SCRIPT_DIR / "sign_staged_release.sh").read_text(encoding="utf-8")
+        promote_script = (SCRIPT_DIR / "promote_release.sh").read_text(encoding="utf-8")
+        public_update_script = (SCRIPT_DIR / "publish_public_update_test.sh").read_text(encoding="utf-8")
+        release_script = (SCRIPT_DIR / "release.sh").read_text(encoding="utf-8")
+
+        package_outer_sign = package_script.index('sign_path "$APP_BUNDLE" "${APP_SIGN_ARGS[@]}"')
+        package_layout = package_script.index('"$CONTROL_PLANE_SCRIPTS_DIR/validate_embedded_mcp_helper_layout.sh"')
+        package_smoke = package_script.index(
+            '"$RUN_WITHOUT_GITHUB_TOKENS" "$CONTROL_PLANE_SCRIPTS_DIR/smoke_embedded_mcp_helper.sh"'
+        )
+        self.assertLess(package_outer_sign, package_layout)
+        self.assertLess(package_layout, package_smoke)
+
+        for privileged_script in (staged_signing_script, promote_script, public_update_script):
+            self.assertIn("validate_embedded_mcp_helper_layout.sh", privileged_script)
+            self.assertNotIn("smoke_embedded_mcp_helper.sh", privileged_script)
+        self.assertIn('require_file "$CONTROL_PLANE_SCRIPTS_DIR/validate_embedded_mcp_helper_layout.sh"', release_script)
+
+    def test_embedded_mcp_helper_smoke_rejects_exit_137(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_dir, True)
+        helper = temp_dir / "RepoPrompt.app" / "Contents" / "MacOS" / "repoprompt-mcp"
+        helper.parent.mkdir(parents=True)
+        helper.write_text("#!/usr/bin/env bash\nexit 137\n", encoding="utf-8")
+        helper.chmod(0o755)
+
+        result = subprocess.run(
+            [str(SCRIPT_DIR / "smoke_embedded_mcp_helper.sh"), str(temp_dir / "RepoPrompt.app"), "Fixture helper"],
+            text=True,
+            capture_output=True,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Fixture helper failed --version smoke (exit 137)", result.stderr)
+
+    def test_embedded_mcp_helper_layout_validator_accepts_canonical_layout(self) -> None:
+        app = self.make_embedded_helper_layout()
+
+        result = self.run_layout_validation(app)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("matches the embedded MCP helper layout policy", result.stdout)
+
+    def test_embedded_mcp_helper_layout_validator_rejects_invalid_metadata(self) -> None:
+        def helper_symlink(app: Path) -> None:
+            helper = app / "Contents" / "MacOS" / "repoprompt-mcp"
+            helper.unlink()
+            helper.symlink_to("RepoPrompt")
+
+        def non_executable_helper(app: Path) -> None:
+            (app / "Contents" / "MacOS" / "repoprompt-mcp").chmod(0o644)
+
+        def missing_resources_link(app: Path) -> None:
+            (app / "Contents" / "Resources" / "repoprompt-mcp").unlink()
+
+        def missing_bin_link(app: Path) -> None:
+            (app / "Contents" / "Resources" / "bin" / "repoprompt-mcp").unlink()
+
+        def alternate_in_app_target(app: Path) -> None:
+            link = app / "Contents" / "Resources" / "repoprompt-mcp"
+            link.unlink()
+            link.symlink_to("../MacOS/RepoPrompt")
+
+        for label, mutate in (
+            ("helper symlink", helper_symlink),
+            ("non-executable helper", non_executable_helper),
+            ("missing resources link", missing_resources_link),
+            ("missing bin link", missing_bin_link),
+            ("alternate in-app target", alternate_in_app_target),
+        ):
+            with self.subTest(label=label):
+                app = self.make_embedded_helper_layout()
+                mutate(app)
+                result = self.run_layout_validation(app)
+                self.assertNotEqual(result.returncode, 0)
+
+    def test_release_workflows_isolate_executable_helper_smoke_and_harden_p12_cleanup(self) -> None:
+        release_workflow = (SCRIPT_DIR.parent / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+        promote_workflow = (SCRIPT_DIR.parent / ".github" / "workflows" / "release-promote.yml").read_text(
+            encoding="utf-8"
+        )
+
+        publish_job = release_workflow.split("\n  publish:", 1)[1].split("\n  smoke-signed-helper:", 1)[0]
+        publish_staged = "        run: ./trusted-control-plane/Scripts/release.sh publish-staged"
+        cleanup_step = "      - name: Remove ephemeral keychain"
+        upload_step = "      - name: Upload signed release ZIP for secret-free smoke"
+        self.assertLess(publish_job.index(publish_staged), publish_job.index(cleanup_step))
+        self.assertLess(publish_job.index(cleanup_step), publish_job.index(upload_step))
+        signed_upload = publish_job.split(upload_step, 1)[1]
+        self.assertIn("release-source/dist/*.zip", signed_upload)
+        self.assertIn("release-source/dist/SHA256SUMS", signed_upload)
+
+        signed_smoke = release_workflow.split("\n  smoke-signed-helper:", 1)[1]
+        self.assertNotIn("environment: release", signed_smoke)
+        self.assertIn("RepoPrompt-CE-signed-release-zip", signed_smoke)
+        self.assertIn("manifests=(signed-release/*SHA256SUMS)", signed_smoke)
+        self.assertIn("Expected exactly one signed ZIP checksum manifest", signed_smoke)
+        self.assertIn("Expected exactly one signed ZIP checksum entry", signed_smoke)
+        self.assertIn("shasum -a 256 -c", signed_smoke)
+        self.assertLess(signed_smoke.index("shasum -a 256 -c"), signed_smoke.index("ditto -x -k"))
+        self.assertIn("validate_embedded_mcp_helper_layout.sh", signed_smoke)
+        self.assertIn("env -i", signed_smoke)
+        self.assertIn("PATH=/usr/bin:/bin:/usr/sbin:/sbin", signed_smoke)
+        self.assertIn('HOME="$HOME"', signed_smoke)
+        self.assertIn('TMPDIR="$RUNNER_TEMP"', signed_smoke)
+
+        reviewed_smoke = promote_workflow.split("\n  smoke-reviewed-helper:", 1)[1].split("\n  promote:", 1)[0]
+        self.assertNotIn("environment: release", reviewed_smoke)
+        self.assertIn("reviewed_checksums_sha256", reviewed_smoke)
+        self.assertIn("validate_embedded_mcp_helper_layout.sh", reviewed_smoke)
+        self.assertIn("env -i", reviewed_smoke)
+        promote_job = promote_workflow.split("\n  promote:", 1)[1]
+        self.assertIn("- smoke-reviewed-helper", promote_job)
+        self.assertIn("environment: release", promote_job)
+
+        p12_import = release_workflow.split("      - name: Import Developer ID certificate", 1)[1].split(
+            "      - name: Prepare provisioning profile and notarization key", 1
+        )[0]
+        self.assertIn("umask 077", p12_import)
+        self.assertLess(
+            p12_import.index("trap cleanup_certificate_and_failed_keychain EXIT"),
+            p12_import.index("base64 --decode"),
+        )
+        self.assertIn('rm -f "$CERTIFICATE_PATH"', p12_import)
+        self.assertIn('security delete-keychain "$KEYCHAIN_PATH" || true', p12_import)
+        final_cleanup = publish_job.split(cleanup_step, 1)[1].split(upload_step, 1)[0]
+        self.assertIn("if: always()", final_cleanup)
+        self.assertIn('KEYCHAIN_PATH="$RUNNER_TEMP/repoprompt-release.keychain-db"', final_cleanup)
+        self.assertIn('CERTIFICATE_PATH="$RUNNER_TEMP/repoprompt-release.p12"', final_cleanup)
+        self.assertIn('rm -f "$CERTIFICATE_PATH"', final_cleanup)
+        self.assertIn('rm -rf "$RUNNER_TEMP/repoprompt-release-secrets"', final_cleanup)
+
+    def test_staged_release_extractor_rejects_alternate_in_app_cli_target(self) -> None:
+        for relative, alternate_target in (
+            ("Contents/Resources/repoprompt-mcp", "../MacOS/RepoPrompt"),
+            ("Contents/Resources/bin/repoprompt-mcp", "../../MacOS/RepoPrompt"),
+        ):
+            with self.subTest(relative=relative):
+                temp_dir = Path(tempfile.mkdtemp())
+                self.addCleanup(shutil.rmtree, temp_dir, True)
+                archive = temp_dir / "stage.zip"
+                destination = temp_dir / "extract"
+                info = zipfile.ZipInfo(f".build/release/RepoPrompt.app/{relative}")
+                info.create_system = 3
+                info.external_attr = (stat.S_IFLNK | 0o777) << 16
+                with zipfile.ZipFile(archive, "w") as output:
+                    output.writestr(info, alternate_target)
+
+                result = subprocess.run(
+                    [str(SCRIPT_DIR / "extract_staged_release.py"), str(archive), str(destination), "RepoPrompt"],
+                    text=True,
+                    capture_output=True,
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("unexpected or escaping staged archive symlink", result.stderr)
+
+    def test_staged_release_validator_rejects_alternate_in_app_cli_target(self) -> None:
+        for relative, alternate_target in (
+            ("Contents/Resources/repoprompt-mcp", "../MacOS/RepoPrompt"),
+            ("Contents/Resources/bin/repoprompt-mcp", "../../MacOS/RepoPrompt"),
+        ):
+            with self.subTest(relative=relative):
+                approved, staged, scripts = self.make_staged_release_fixture()
+                link = staged / ".build" / "release" / "RepoPrompt.app" / relative
+                link.unlink()
+                link.symlink_to(alternate_target)
+
+                result = self.run_staged_validation(approved, staged, scripts)
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("unexpected or escaping staged symlink", result.stderr)
+
+    def test_runtime_bundle_verifier_is_removed_without_changing_sparkle_or_anti_debug_startup(self) -> None:
         app_delegate = (SCRIPT_DIR.parent / "Sources" / "RepoPrompt" / "App" / "AppDelegate.swift").read_text(
             encoding="utf-8"
         )
+        application_security = (
+            SCRIPT_DIR.parent / "Sources" / "RepoPrompt" / "App" / "ApplicationSecurity.swift"
+        ).read_text(encoding="utf-8")
         sparkle_manager = (
             SCRIPT_DIR.parent / "Sources" / "RepoPrompt" / "App" / "Sparkle" / "SparkleUpdateManager.swift"
         ).read_text(encoding="utf-8")
+        security_root = SCRIPT_DIR.parent / "Sources" / "RepoPrompt" / "Infrastructure" / "Security"
+        runtime_sources = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in (SCRIPT_DIR.parent / "Sources" / "RepoPrompt").rglob("*.swift")
+        )
 
-        self.assertIn("startingUpdater: false", app_delegate)
-        verification = app_delegate.index("let isValid = try await verificationService.verify()")
-        release_activation = app_delegate.index("sparkleManager.startUpdater()", verification)
-        self.assertLess(verification, release_activation)
+        self.assertNotIn("BundleVerificationService", app_delegate)
+        self.assertNotIn("Application integrity check failed", app_delegate)
+        self.assertFalse((security_root / "BundleVerificationService.swift").exists())
+        self.assertFalse((security_root / "BundleVerifier.swift").exists())
+        self.assertEqual(app_delegate.count("sparkleManager.startUpdater()"), 2)
+        self.assertIn("ApplicationSecurity.startMonitoring()", app_delegate)
+        self.assertIn("ApplicationSecurity.enableAntiDebugging()", app_delegate)
+        self.assertNotIn("BundleVerifier", application_security)
+        self.assertNotIn("verifyBundleSignature", application_security)
+        self.assertNotIn("SecStaticCodeCheckValidity", application_security)
+        self.assertNotIn("BundleVerifier.verifyBundleSignature", runtime_sources)
         manager_init = sparkle_manager.split("init(updaterController: SPUStandardUpdaterController) {", 1)[1].split(
             "\n    func startUpdater()", 1
         )[0]
@@ -166,6 +379,10 @@ class ReleaseToolingTests(unittest.TestCase):
         release_script = (SCRIPT_DIR / "release.sh").read_text(encoding="utf-8")
         self.assertIn('"$RUN_WITHOUT_GITHUB_TOKENS" swift package resolve', release_script)
         self.assertEqual(package_script.count('"$RUN_WITHOUT_GITHUB_TOKENS" swift build'), 4)
+        self.assertIn(
+            '"$RUN_WITHOUT_GITHUB_TOKENS" "$CONTROL_PLANE_SCRIPTS_DIR/smoke_embedded_mcp_helper.sh"',
+            package_script,
+        )
         self.assertIn("unset GH_TOKEN GITHUB_TOKEN SOURCE_GH_TOKEN", release_script)
 
     def test_sparkle_vendor_manifest_rejects_extra_file_and_symlink_redirect(self) -> None:
@@ -366,6 +583,30 @@ class ReleaseToolingTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("canonical", result.stderr)
 
+    def make_embedded_helper_layout(self) -> Path:
+        temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_dir, True)
+        app = temp_dir / "RepoPrompt.app"
+        macos = app / "Contents" / "MacOS"
+        resources_bin = app / "Contents" / "Resources" / "bin"
+        macos.mkdir(parents=True)
+        resources_bin.mkdir(parents=True)
+        (macos / "RepoPrompt").write_text("RepoPrompt\n", encoding="utf-8")
+        helper = macos / "repoprompt-mcp"
+        helper.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        helper.chmod(0o755)
+        (app / "Contents" / "Resources" / "repoprompt-mcp").symlink_to("../MacOS/repoprompt-mcp")
+        (resources_bin / "repoprompt-mcp").symlink_to("../../MacOS/repoprompt-mcp")
+        return app
+
+    @staticmethod
+    def run_layout_validation(app: Path) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(SCRIPT_DIR / "validate_embedded_mcp_helper_layout.sh"), str(app), "Fixture helper layout"],
+            text=True,
+            capture_output=True,
+        )
+
     def make_metadata_root(self) -> Path:
         root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, root, True)
@@ -395,11 +636,17 @@ SIGNING_TEAM_ID=648A27MST5
             staged / "ThirdPartyLicenses" / "fixture",
             app / "Contents" / "Frameworks" / "Sparkle.framework",
             app / "Contents" / "MacOS",
+            app / "Contents" / "Resources" / "bin",
             app / "Contents" / "Resources" / "Legal" / "ThirdPartyLicenses" / "fixture",
             scripts,
         ):
             directory.mkdir(parents=True, exist_ok=True)
-        for name in ("load_release_metadata.sh", "validate_packaged_legal.sh", "validate_staged_release.sh"):
+        for name in (
+            "load_release_metadata.sh",
+            "validate_embedded_mcp_helper_layout.sh",
+            "validate_packaged_legal.sh",
+            "validate_staged_release.sh",
+        ):
             shutil.copy2(SCRIPT_DIR / name, scripts / name)
             scripts.joinpath(name).chmod(0o755)
         metadata = """\
@@ -430,6 +677,9 @@ SIGNING_TEAM_ID=648A27MST5
         (app / "Contents" / "Info.plist").write_text(template, encoding="utf-8")
         for name in ("RepoPrompt", "repoprompt-mcp"):
             (app / "Contents" / "MacOS" / name).write_text(name, encoding="utf-8")
+        (app / "Contents" / "MacOS" / "repoprompt-mcp").chmod(0o755)
+        (app / "Contents" / "Resources" / "repoprompt-mcp").symlink_to("../MacOS/repoprompt-mcp")
+        (app / "Contents" / "Resources" / "bin" / "repoprompt-mcp").symlink_to("../../MacOS/repoprompt-mcp")
         legal = app / "Contents" / "Resources" / "Legal"
         shutil.copy2(staged / "LICENSE", legal / "LICENSE")
         shutil.copy2(staged / "THIRD_PARTY_NOTICES.md", legal / "THIRD_PARTY_NOTICES.md")

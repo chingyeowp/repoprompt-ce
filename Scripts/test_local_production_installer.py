@@ -91,7 +91,7 @@ class LocalProductionInstallerTests(unittest.TestCase):
         self.assertFalse(capture.exists())
         self.assertIn("Install canceled.", result.stdout)
 
-    def test_finder_launcher_falls_back_to_direct_installer_without_python3(self) -> None:
+    def test_finder_launcher_fails_early_without_python3_and_invokes_no_installer(self) -> None:
         launcher = ROOT_DIR / "Install RepoPrompt CE Local Production.command"
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -101,12 +101,12 @@ class LocalProductionInstallerTests(unittest.TestCase):
             scripts = root / "Scripts"
             scripts.mkdir()
             capture = root / "capture.txt"
-            direct_installer = scripts / "install_local_production.sh"
-            direct_installer.write_text(
-                "#!/bin/bash\nprintf '%s\\n' \"$CONFIRM_LOCAL_PRODUCTION_INSTALL\" > \"$LAUNCHER_CAPTURE\"\n",
-                encoding="utf-8",
-            )
-            direct_installer.chmod(0o755)
+            for executable in (root / "conductor", scripts / "install_local_production.sh"):
+                executable.write_text(
+                    "#!/bin/bash\nprintf 'invoked\\n' >> \"$LAUNCHER_CAPTURE\"\n",
+                    encoding="utf-8",
+                )
+                executable.chmod(0o755)
             bin_dir = root / "bin"
             bin_dir.mkdir()
             dirname = shutil.which("dirname")
@@ -119,16 +119,19 @@ class LocalProductionInstallerTests(unittest.TestCase):
             result = subprocess.run(
                 ["/bin/bash", str(copied_launcher)],
                 env=env,
-                input="y\n\n",
+                input="\n",
                 text=True,
                 capture_output=True,
                 timeout=10,
             )
-            captured_lines = capture.read_text(encoding="utf-8").splitlines()
 
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(captured_lines, ["1"])
-        self.assertIn("Mode:    direct (python3 unavailable - running without the dev daemon)", result.stdout)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(capture.exists())
+        self.assertIn("Python 3 is required to install RepoPrompt CE from Finder.", result.stdout)
+        self.assertNotIn("Build and replace", result.stdout + result.stderr)
+        launcher_text = launcher.read_text(encoding="utf-8")
+        self.assertNotIn("INSTALL_MODE", launcher_text)
+        self.assertNotIn("install_local_production.sh", launcher_text)
 
     def test_local_entitlements_keep_runtime_capabilities_without_developer_id_identity_keys(self) -> None:
         template = ROOT_DIR / "AppBundle" / "RepoPrompt.local-self-signed.entitlements.template"
@@ -139,6 +142,7 @@ class LocalProductionInstallerTests(unittest.TestCase):
             entitlements,
             {
                 "com.apple.security.cs.allow-jit": True,
+                "com.apple.security.cs.disable-library-validation": True,
                 "com.apple.security.files.bookmarks.app-scope": True,
                 "com.apple.security.temporary-exception.mach-lookup.global-name": [
                     "__BUNDLE_ID__-spks",
@@ -151,6 +155,7 @@ class LocalProductionInstallerTests(unittest.TestCase):
         self.assertIn('LOCAL_SELF_SIGNED_CERTIFICATE_NAME="RepoPrompt CE Local Self-Signed Code Signing"', package_script)
         self.assertIn('phase "Rendering local self-signed entitlements"', package_script)
         self.assertIn('APP_SIGN_ARGS+=(--entitlements "$APP_ENTITLEMENTS")', package_script)
+        self.assertNotIn("REPOPROMPT_LOCAL_SELF_SIGNED_BUILD", package_script)
 
     def test_failed_replacement_restores_prior_app_and_preserves_spaces_in_keychain_path(self) -> None:
         result, install_dir = self.run_installer(fail_final_install_move=True)

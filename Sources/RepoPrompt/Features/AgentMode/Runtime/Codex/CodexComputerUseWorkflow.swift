@@ -33,17 +33,30 @@ private enum CodexNativeFeatureGate: Hashable {
         }
     }
 
+    private var defaultPersistedValue: Bool {
+        switch self {
+        case .goals:
+            true
+        case .computerUse:
+            false
+        }
+    }
+
     func isEnabled(defaults: UserDefaults) -> Bool {
-        isEnabled(persistedValue: defaults.bool(forKey: defaultsKey))
+        isEnabled(persistedValue: defaults.object(forKey: defaultsKey) as? Bool)
     }
 
     func isEnabled(persistedValue: Bool) -> Bool {
+        isEnabled(persistedValue: Optional(persistedValue))
+    }
+
+    func isEnabled(persistedValue: Bool?) -> Bool {
         #if DEBUG
             if let override = testingOverride {
                 return override
             }
         #endif
-        return persistedValue || environmentFlagEnabled
+        return (persistedValue ?? defaultPersistedValue) || environmentFlagEnabled
     }
 
     func setEnabled(_ value: Bool, defaults: UserDefaults) {
@@ -77,7 +90,7 @@ private enum CodexNativeFeatureGate: Hashable {
 }
 
 enum CodexGoalSupport {
-    static let disabledMessage = "Codex goal support is disabled. Enable Codex Goals in settings or set app_settings key 'agent_mode.codex_goal_support_enabled' to true to use /goal."
+    static let disabledMessage = "Codex goal support is turned off. Re-enable Codex Goals in settings or set app_settings key 'agent_mode.codex_goal_support_enabled' to true to use /goal."
 
     @MainActor
     static var isEnabled: Bool {
@@ -89,6 +102,10 @@ enum CodexGoalSupport {
     }
 
     static func isEnabled(persistedValue: Bool) -> Bool {
+        CodexNativeFeatureGate.goals.isEnabled(persistedValue: persistedValue)
+    }
+
+    static func isEnabled(persistedValue: Bool?) -> Bool {
         CodexNativeFeatureGate.goals.isEnabled(persistedValue: persistedValue)
     }
 

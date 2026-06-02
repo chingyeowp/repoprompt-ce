@@ -3,22 +3,18 @@ set -uo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONDUCTOR="$ROOT_DIR/conductor"
-INSTALL_SCRIPT="$ROOT_DIR/Scripts/install_local_production.sh"
-INSTALL_MODE="coordinated"
 INSTALL_DIR="${LOCAL_PRODUCTION_INSTALL_DIR:-/Applications}"
 TARGET_APP="$INSTALL_DIR/RepoPrompt CE.app"
 
 if ! command -v python3 >/dev/null 2>&1; then
-    INSTALL_MODE="direct"
-    if [[ ! -x "$INSTALL_SCRIPT" ]]; then
-        echo "Python 3 isn't available, and the direct installer script is missing:"
-        echo "$INSTALL_SCRIPT"
-        echo
-        echo "Make sure this file is still in the repoprompt-ce folder and that Scripts/install_local_production.sh is executable."
-        read -r -p "Press Return to close this window..." || true
-        exit 1
-    fi
-elif [[ ! -x "$CONDUCTOR" ]]; then
+    echo "Python 3 is required to install RepoPrompt CE from Finder."
+    echo
+    echo "Install Python 3, then run this launcher again."
+    read -r -p "Press Return to close this window..." || true
+    exit 1
+fi
+
+if [[ ! -x "$CONDUCTOR" ]]; then
     echo "Couldn't find the coordinated installer:"
     echo "$CONDUCTOR"
     echo
@@ -32,22 +28,14 @@ install_app() {
     echo "Building and installing RepoPrompt CE..."
     echo "macOS may ask you to approve the dedicated local code-signing certificate."
     echo
-    if [[ "$INSTALL_MODE" == "coordinated" ]]; then
-        CONFIRM_LOCAL_PRODUCTION_INSTALL=1 "$CONDUCTOR" release local-install
-    else
-        CONFIRM_LOCAL_PRODUCTION_INSTALL=1 "$INSTALL_SCRIPT"
-    fi
+    CONFIRM_LOCAL_PRODUCTION_INSTALL=1 "$CONDUCTOR" release local-install
 }
 
 clear 2>/dev/null || true
 echo "RepoPrompt CE - local self-signed production installer"
 echo
 echo "Project: $ROOT_DIR"
-if [[ "$INSTALL_MODE" == "coordinated" ]]; then
-    echo "Mode:    coordinated (build and install run through the dev daemon)"
-else
-    echo "Mode:    direct (python3 unavailable - running without the dev daemon)"
-fi
+echo "Mode:    coordinated (build and install run through the dev daemon)"
 echo
 echo "This builds a release-mode app and replaces any existing app at:"
 echo "$TARGET_APP"

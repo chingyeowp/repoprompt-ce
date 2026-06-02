@@ -142,14 +142,19 @@ class ReleasePromotionTests(unittest.TestCase):
         fake_bin = temp_dir / "bin"
         app = temp_dir / "fixture" / "RepoPrompt.app"
         dmg_app = temp_dir / "dmg-fixture" / "RepoPrompt.app"
-        for directory in (scripts, vendor_bin, assets, fake_bin, app / "Contents"):
+        for directory in (scripts, vendor_bin, assets, fake_bin, app / "Contents" / "MacOS", app / "Contents" / "Resources" / "bin"):
             directory.mkdir(parents=True, exist_ok=True)
 
         shutil.copy2(SCRIPT_DIR / "promote_release.sh", scripts / "promote_release.sh")
+        shutil.copy2(
+            SCRIPT_DIR / "validate_embedded_mcp_helper_layout.sh",
+            scripts / "validate_embedded_mcp_helper_layout.sh",
+        )
         shutil.copy2(SCRIPT_DIR / "validate_packaged_legal.sh", scripts / "validate_packaged_legal.sh")
         shutil.copy2(SCRIPT_DIR / "load_release_metadata.sh", scripts / "load_release_metadata.sh")
         shutil.copy2(SCRIPT_DIR / "verify_sparkle_signature.swift", scripts / "verify_sparkle_signature.swift")
         (scripts / "promote_release.sh").chmod(0o755)
+        (scripts / "validate_embedded_mcp_helper_layout.sh").chmod(0o755)
         (scripts / "validate_packaged_legal.sh").chmod(0o755)
         self.write_stub(scripts, "verify_remote_release_commit.sh", "printf 'OK: fixture remote tag remains bound.\\n'\n")
         self.write_stub(scripts, "verify_sparkle_vendor.sh", "printf 'OK: fixture Sparkle payload matches.\\n'\n")
@@ -167,8 +172,15 @@ class ReleasePromotionTests(unittest.TestCase):
             encoding="utf-8",
         )
         (app / "Contents" / "Info.plist").write_text("fixture plist\n", encoding="utf-8")
+        self.write_stub(
+            app / "Contents" / "MacOS",
+            "repoprompt-mcp",
+            "printf 'ERROR: fixture packaged helper must not execute\\n' >&2\nexit 137\n",
+        )
+        (app / "Contents" / "Resources" / "repoprompt-mcp").symlink_to("../MacOS/repoprompt-mcp")
+        (app / "Contents" / "Resources" / "bin" / "repoprompt-mcp").symlink_to("../../MacOS/repoprompt-mcp")
         self.write_legal_tree(root, app)
-        shutil.copytree(app, dmg_app)
+        shutil.copytree(app, dmg_app, symlinks=True)
         if mismatched_dmg_app:
             (dmg_app / "Contents" / "dmg-only-drift.txt").write_text("drift\n", encoding="utf-8")
 

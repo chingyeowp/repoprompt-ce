@@ -225,12 +225,11 @@ struct CodexProviderToolsRuntimeSection: View {
 
             ProviderRuntimeToggleRow(
                 title: "Goals",
-                description: "Enable experimental /goal mode so Codex can continue working through long tasks without waiting for each turn. Use this only when you are comfortable with extended unattended runs.",
-                badge: "Experimental",
+                description: "Codex /goal support is enabled by default so long-running tasks can continue between turns. Turn it off if you do not want RepoPrompt to start Codex with goal support.",
                 isOn: tools.goalSupportEnabled,
                 onChange: onSetGoalSupportEnabled
             )
-            .help("Enables Codex features.goals for app-server launch and thread config.")
+            .hoverTooltip("Controls Codex features.goals for app-server launch and thread config; enabled by default until turned off.")
 
             ProviderRuntimeSubsection(
                 title: "MCP servers",

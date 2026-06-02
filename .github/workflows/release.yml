@@ -144,16 +144,26 @@ jobs:
           CONFIGURED_SIGN_IDENTITY: ${{ vars.SIGN_IDENTITY }}
         run: |
           set -euo pipefail
+          umask 077
           KEYCHAIN_PATH="$RUNNER_TEMP/repoprompt-release.keychain-db"
           CERTIFICATE_PATH="$RUNNER_TEMP/repoprompt-release.p12"
+          keychain_created=0
+          cleanup_certificate_and_failed_keychain() {
+            status=$?
+            rm -f "$CERTIFICATE_PATH"
+            if (( status != 0 )) && (( keychain_created )); then
+              security delete-keychain "$KEYCHAIN_PATH" || true
+            fi
+          }
+          trap cleanup_certificate_and_failed_keychain EXIT
           printf '%s' "$CERTIFICATE_P12_BASE64" | base64 --decode > "$CERTIFICATE_PATH"
           security create-keychain -p "$CI_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          keychain_created=1
           security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
           security unlock-keychain -p "$CI_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security import "$CERTIFICATE_PATH" -k "$KEYCHAIN_PATH" -P "$CERTIFICATE_P12_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$CI_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security list-keychains -d user -s "$KEYCHAIN_PATH"
-          rm -f "$CERTIFICATE_PATH"
           echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
           echo "SIGN_IDENTITY=${CONFIGURED_SIGN_IDENTITY:-Developer ID Application: Eric Provencher (648A27MST5)}" >> "$GITHUB_ENV"
 
@@ -190,5 +200,72 @@ jobs:
       - name: Remove ephemeral keychain
         if: always()
         run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/repoprompt-release.keychain-db"
+          CERTIFICATE_PATH="$RUNNER_TEMP/repoprompt-release.p12"
           security delete-keychain "$KEYCHAIN_PATH" || true
+          rm -f "$CERTIFICATE_PATH"
           rm -rf "$RUNNER_TEMP/repoprompt-release-secrets"
+
+      - name: Upload signed release ZIP for secret-free smoke
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: RepoPrompt-CE-signed-release-zip
+          path: |
+            release-source/dist/*.zip
+            release-source/dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 1
+
+  smoke-signed-helper:
+    name: Smoke Signed Helper Without Release Secrets
+    needs:
+      - validate-ref
+      - publish
+    if: github.ref == 'refs/heads/main'
+    runs-on: macos-26
+    permissions:
+      contents: read
+    steps:
+      - name: Check out trusted release tooling
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ needs.validate-ref.outputs.tooling-commit }}
+          path: trusted-control-plane
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download signed release ZIP
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: RepoPrompt-CE-signed-release-zip
+          path: signed-release
+
+      - name: Extract and statically validate signed helper layout
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          archives=(signed-release/*.zip)
+          manifests=(signed-release/*SHA256SUMS)
+          [[ "${#archives[@]}" == "1" ]] || { echo "Expected exactly one signed ZIP" >&2; exit 1; }
+          [[ "${#manifests[@]}" == "1" ]] || { echo "Expected exactly one signed ZIP checksum manifest" >&2; exit 1; }
+          archive="${archives[0]}"
+          archive_name="$(basename "$archive")"
+          archive_checksum_entry="$RUNNER_TEMP/signed-release-zip.sha256"
+          awk -v archive_name="$archive_name" '$2 == archive_name { print }' "${manifests[0]}" > "$archive_checksum_entry"
+          [[ "$(wc -l < "$archive_checksum_entry" | tr -d ' ')" == "1" ]] || { echo "Expected exactly one signed ZIP checksum entry" >&2; exit 1; }
+          (cd signed-release && shasum -a 256 -c "$archive_checksum_entry")
+          mkdir extracted
+          ditto -x -k "$archive" extracted
+          ./trusted-control-plane/Scripts/validate_embedded_mcp_helper_layout.sh \
+            extracted/RepoPrompt.app \
+            "Signed draft MCP helper layout"
+
+      - name: Execute signed helper without inherited secrets
+        run: |
+          env -i \
+            PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+            HOME="$HOME" \
+            TMPDIR="$RUNNER_TEMP" \
+            ./trusted-control-plane/Scripts/smoke_embedded_mcp_helper.sh \
+            extracted/RepoPrompt.app \
+            "Signed draft MCP helper"

@@ -63,9 +63,6 @@ bool repo_parse_gitignore_line(const char *line, repo_gitignore_pattern *result)
 #include "../../RepoPromptC/include/path_search.h"
 
 
-// Monotonic clock helper
-#include "../../RepoPromptC/include/MonotonicClock.h"
-
 // PCRE2 regex (vendored from SwiftPCRE2)
 #include "../../CSwiftPCRE2/include/CSwiftPCRE2.h"
 

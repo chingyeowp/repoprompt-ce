@@ -36,7 +36,7 @@ Sources/
       Persistence/               # shared persistence helpers such as preset file storage
       Process/                   # process/CLI launch substrate
       Regex/                     # reusable regex adapters/toolkit
-      Security/                  # keychain, signing, secure storage, and bundle verification
+      Security/                  # keychain, signing, and secure storage
       SyntaxParsing/             # syntax parsing and tree-sitter query infrastructure
       UI/                        # reusable UI components, text/markdown/tooltip/mention substrate, UI services
       Utilities/                 # narrow generic utilities/extensions
