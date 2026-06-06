@@ -182,6 +182,29 @@ final class CLIPathInstallerTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: installURL), "foreign")
     }
 
+    func testPrivilegedWrapperOwnershipRecheckRejectsMarkerBelowLineEight() throws {
+        let installURL = root.appendingPathComponent("bin/claude-rpce-debug")
+        try FileManager.default.createDirectory(at: installURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let sourceURL = root.appendingPathComponent("managed-wrapper")
+        let source = "#!/bin/bash\n\(ManagedCLIPathPolicy.currentClaudeWrapperMarker)\nexec claude\n"
+        try source.write(to: sourceURL, atomically: true, encoding: .utf8)
+        let racedContent = (1 ... 8).map { "# foreign line \($0)" }.joined(separator: "\n")
+            + "\n\(ManagedCLIPathPolicy.currentClaudeWrapperMarker)\nexec foreign\n"
+        try racedContent.write(to: installURL, atomically: true, encoding: .utf8)
+
+        let command = CLIPathInstaller.test_atomicManagedWrapperInstallCommand(
+            sourcePath: sourceURL.path,
+            installPath: installURL.path
+        )
+        let result = try TestProcessRunner.run(
+            executableURL: URL(fileURLWithPath: "/bin/bash"),
+            arguments: ["-c", command]
+        )
+
+        XCTAssertEqual(result.terminationStatus, 73, result.outputText)
+        XCTAssertEqual(try String(contentsOf: installURL), racedContent)
+    }
+
     func testWrapperMarkerMustBeExactHeaderLine() {
         let current = "#!/bin/bash\n\(ManagedCLIPathPolicy.currentClaudeWrapperMarker)\nexec claude\n"
         XCTAssertTrue(ManagedCLIPathPolicy.isManagedWrapper(current))

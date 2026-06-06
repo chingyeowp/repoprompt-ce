@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 import plistlib
+import re
 import shutil
 import subprocess
 import sys
@@ -382,6 +383,75 @@ class LocalProductionInstallerTests(unittest.TestCase):
         self.assertIn("Another local production install is active", result.stderr)
         self.assertTrue(Path(f"{context['registry']}.lock").is_dir())
 
+    def test_failed_registry_backup_preserves_prior_app_and_registry(self) -> None:
+        result, context = self.run_installer(
+            [certificate(SHA1_A, SHA256_A), certificate(SHA1_B, SHA256_B)],
+            registry={"fingerprint": SHA256_A, "generation": 4},
+            selected=SHA256_B,
+            rotate=True,
+            expected_sha1=SHA1_B,
+            fail_registry_backup_copy=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((context["install_dir"] / "RepoPrompt CE.app" / "payload.txt").read_text(), "old\n")
+        self.assertEqual(self.registry(context)["certificateSHA256"], SHA256_A)
+        self.assertEqual(self.registry(context)["serviceGeneration"], 4)
+        self.assertEqual(context["registry"].stat().st_mode & 0o777, 0o600)
+        self.assertEqual(list(context["install_dir"].glob(".RepoPrompt CE.app.backup.*")), [])
+
+    def test_failed_registry_write_restores_prior_app_and_exact_registry(self) -> None:
+        result, context = self.run_installer(
+            [certificate(SHA1_A, SHA256_A), certificate(SHA1_B, SHA256_B)],
+            registry={"fingerprint": SHA256_A, "generation": 4},
+            selected=SHA256_B,
+            rotate=True,
+            expected_sha1=SHA1_B,
+            fail_registry_write=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((context["install_dir"] / "RepoPrompt CE.app" / "payload.txt").read_text(), "old\n")
+        self.assertEqual(self.registry(context)["certificateSHA256"], SHA256_A)
+        self.assertEqual(self.registry(context)["serviceGeneration"], 4)
+        self.assertEqual(context["registry"].stat().st_mode & 0o777, 0o600)
+        self.assertEqual(list(context["install_dir"].glob(".RepoPrompt CE.app.backup.*")), [])
+
+    def test_failed_app_backup_preserves_prior_app_and_registry(self) -> None:
+        result, context = self.run_installer(
+            [certificate(SHA1_A, SHA256_A), certificate(SHA1_B, SHA256_B)],
+            registry={"fingerprint": SHA256_A, "generation": 4},
+            selected=SHA256_B,
+            rotate=True,
+            expected_sha1=SHA1_B,
+            fail_app_backup_move=True,
+            fail_registry_restore_copy=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((context["install_dir"] / "RepoPrompt CE.app" / "payload.txt").read_text(), "old\n")
+        self.assertEqual(self.registry(context)["certificateSHA256"], SHA256_A)
+        self.assertEqual(self.registry(context)["serviceGeneration"], 4)
+        self.assertEqual(list(context["install_dir"].glob(".RepoPrompt CE.app.backup.*")), [])
+
+    def test_failed_registry_restore_preserves_snapshot_for_manual_recovery(self) -> None:
+        result, context = self.run_installer(
+            [certificate(SHA1_A, SHA256_A), certificate(SHA1_B, SHA256_B)],
+            registry={"fingerprint": SHA256_A, "generation": 4},
+            selected=SHA256_B,
+            rotate=True,
+            expected_sha1=SHA1_B,
+            fail_registry_write=True,
+            fail_registry_restore_copy=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((context["install_dir"] / "RepoPrompt CE.app" / "payload.txt").read_text(), "old\n")
+        self.assertEqual(context["registry"].read_text(encoding="utf-8"), "damaged registry\n")
+        match = re.search(r"Preserving failed transaction snapshot for manual recovery: ([^\n]+)", result.stderr)
+        self.assertIsNotNone(match, result.stderr)
+        preserved = Path(match.group(1))
+        self.addCleanup(shutil.rmtree, preserved, True)
+        snapshot = preserved / "local-signing-identity-registry.backup"
+        self.assertTrue(snapshot.is_file())
+        self.assertEqual(json.loads(snapshot.read_text(encoding="utf-8"))["certificateSHA256"], SHA256_A)
+
     def test_failed_postwrite_registry_verification_restores_prior_app_and_registry(self) -> None:
         result, context = self.run_installer(
             [certificate(SHA1_A, SHA256_A), certificate(SHA1_B, SHA256_B)],
@@ -425,18 +495,24 @@ class LocalProductionInstallerTests(unittest.TestCase):
         rotate: bool = False,
         after_mint: list[dict[str, Any]] | None = None,
         fail_final_install_move: bool = False,
+        fail_app_backup_move: bool = False,
+        fail_registry_backup_copy: bool = False,
+        fail_registry_write: bool = False,
+        fail_registry_restore_copy: bool = False,
         openssl_rejects_legacy: bool = False,
         preexisting_lock: bool = False,
         fail_registry_verification: bool = False,
     ) -> tuple[subprocess.CompletedProcess[str], dict[str, Any]]:
         temp_dir = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, temp_dir, True)
+        installer_tmp = temp_dir / "tmp"
+        installer_tmp.mkdir()
         root = temp_dir / "repo"
         scripts = root / "Scripts"
         scripts.mkdir(parents=True)
         shutil.copy2(SCRIPT_DIR / "install_local_production.sh", scripts / "install_local_production.sh")
         shutil.copy2(SCRIPT_DIR / "local_signing_identity.py", scripts / "local_signing_identity.py")
-        if fail_registry_verification:
+        if fail_registry_verification or fail_registry_write:
             real_tool = scripts / "local_signing_identity_real.py"
             shutil.move(scripts / "local_signing_identity.py", real_tool)
             (scripts / "local_signing_identity.py").write_text(
@@ -445,10 +521,17 @@ class LocalProductionInstallerTests(unittest.TestCase):
                     import os
                     import subprocess
                     import sys
+                    from pathlib import Path
 
                     marker = os.environ["FAIL_REGISTRY_READ_MARKER"]
                     real_tool = os.path.join(os.path.dirname(__file__), "local_signing_identity_real.py")
                     command = sys.argv[1] if len(sys.argv) > 1 else ""
+                    if command == "write-registry" and os.environ.get("FAIL_REGISTRY_WRITE") == "1":
+                        path = Path(sys.argv[sys.argv.index("--path") + 1])
+                        path.write_text("damaged registry\\n", encoding="utf-8")
+                        path.chmod(0o644)
+                        print("ERROR: simulated registry write failure", file=sys.stderr)
+                        raise SystemExit(2)
                     if command == "read-registry" and os.path.exists(marker):
                         print("ERROR: simulated post-write registry verification failure", file=sys.stderr)
                         raise SystemExit(2)
@@ -571,8 +654,24 @@ class LocalProductionInstallerTests(unittest.TestCase):
         self.write_stub(bin_dir, "ditto", 'cp -R "$1" "$2"\n')
         self.write_stub(
             bin_dir,
+            "cp",
+            """\
+            if [[ "${FAIL_REGISTRY_BACKUP_COPY:-0}" == "1" && "$#" == "3" && "$1" == "-p" && "$2" == "$FAKE_REGISTRY_PATH" ]]; then
+                exit 29
+            fi
+            if [[ "${FAIL_REGISTRY_RESTORE_COPY:-0}" == "1" && "$#" == "3" && "$1" == "-p" && "$2" == *"local-signing-identity-registry.backup" ]]; then
+                exit 30
+            fi
+            exec /bin/cp "$@"
+            """,
+        )
+        self.write_stub(
+            bin_dir,
             "mv",
             """\
+            if [[ "${FAIL_APP_BACKUP_MOVE:-0}" == "1" && "$1" == "$FAKE_INSTALLED_APP" && "$2" == *".backup."*"/RepoPrompt CE.app" ]]; then
+                exit 24
+            fi
             if [[ "${FAIL_FINAL_INSTALL_MOVE:-0}" == "1" && "$1" == *".installing."*"/RepoPrompt CE.app" && "$2" == *"/RepoPrompt CE.app" ]]; then
                 exit 23
             fi
@@ -599,7 +698,14 @@ class LocalProductionInstallerTests(unittest.TestCase):
                 "PACKAGE_CAPTURE": str(package_capture),
                 "OPENSSL_REJECTS_LEGACY": "1" if openssl_rejects_legacy else "0",
                 "FAIL_FINAL_INSTALL_MOVE": "1" if fail_final_install_move else "0",
+                "FAIL_APP_BACKUP_MOVE": "1" if fail_app_backup_move else "0",
+                "FAIL_REGISTRY_BACKUP_COPY": "1" if fail_registry_backup_copy else "0",
+                "FAIL_REGISTRY_WRITE": "1" if fail_registry_write else "0",
+                "FAIL_REGISTRY_RESTORE_COPY": "1" if fail_registry_restore_copy else "0",
                 "FAIL_REGISTRY_READ_MARKER": str(temp_dir / "fail-registry-read"),
+                "TMPDIR": str(installer_tmp),
+                "FAKE_REGISTRY_PATH": str(registry_path),
+                "FAKE_INSTALLED_APP": str(installed_app),
             }
         )
         if selected:
@@ -615,6 +721,7 @@ class LocalProductionInstallerTests(unittest.TestCase):
             "package_capture": package_capture,
             "security_log": security_log,
             "import_log": import_log,
+            "tmp_root": installer_tmp,
         }
         return self.invoke(context), context
 

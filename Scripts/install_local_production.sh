@@ -24,6 +24,11 @@ BACKUP_APP=""
 REGISTRY_LOCK_DIR=""
 REGISTRY_BACKUP_PATH=""
 REGISTRY_EXISTED=0
+REGISTRY_MUTATION_STARTED=0
+PRESERVE_TRANSACTION_SNAPSHOT=0
+TRANSACTION_ACTIVE=0
+APP_BACKED_UP=0
+APP_INSTALLED=0
 
 fail() {
     printf 'ERROR: %s\n' "$*" >&2
@@ -35,21 +40,29 @@ require_command() {
 }
 
 cleanup() {
-    [[ -z "$TMP_DIR" ]] || rm -rf "$TMP_DIR"
+    local status=$?
+    trap - EXIT
+    set +e
+    if (( status != 0 && TRANSACTION_ACTIVE )); then
+        rollback_transaction || status=1
+    fi
+    if [[ -n "$TMP_DIR" ]]; then
+        if (( PRESERVE_TRANSACTION_SNAPSHOT )); then
+            printf 'ERROR: Preserving failed transaction snapshot for manual recovery: %s\n' "$TMP_DIR" >&2
+        else
+            rm -rf "$TMP_DIR"
+        fi
+    fi
     [[ -z "$STAGED_DIR" ]] || rm -rf "$STAGED_DIR"
     if [[ -n "$BACKUP_APP" && -e "$BACKUP_APP" ]]; then
-        if [[ ! -e "$LOCAL_PRODUCTION_APP" ]]; then
-            mv "$BACKUP_APP" "$LOCAL_PRODUCTION_APP" ||
-                printf 'ERROR: Could not restore prior app from backup: %s\n' "$BACKUP_APP" >&2
-        else
-            printf 'WARNING: Preserving prior app backup after failed replacement: %s\n' "$BACKUP_APP" >&2
-        fi
+        printf 'WARNING: Preserving prior app backup after rollback failure: %s\n' "$BACKUP_APP" >&2
     fi
     [[ -z "$BACKUP_DIR" ]] || rmdir "$BACKUP_DIR" 2>/dev/null || true
     if [[ -n "$REGISTRY_LOCK_DIR" ]]; then
         rm -f "$REGISTRY_LOCK_DIR/pid"
         rmdir "$REGISTRY_LOCK_DIR" 2>/dev/null || true
     fi
+    exit "$status"
 }
 trap cleanup EXIT
 
@@ -129,20 +142,59 @@ EOF
     security add-trusted-cert -r trustRoot -p codeSign -k "$LOGIN_KEYCHAIN" "$CERTIFICATE_PEM"
 }
 
-rollback_installed_app() {
-    rm -rf "$LOCAL_PRODUCTION_APP"
-    if [[ -n "$BACKUP_APP" && -e "$BACKUP_APP" ]]; then
-        mv "$BACKUP_APP" "$LOCAL_PRODUCTION_APP"
-        BACKUP_APP=""
+rollback_transaction() {
+    local rollback_failed=0
+    if (( APP_INSTALLED )); then
+        rm -rf "$LOCAL_PRODUCTION_APP" || {
+            printf 'ERROR: Could not remove failed installed app during rollback: %s\n' "$LOCAL_PRODUCTION_APP" >&2
+            rollback_failed=1
+        }
+        APP_INSTALLED=0
     fi
-}
-
-rollback_registry() {
-    if (( REGISTRY_EXISTED )); then
-        mv "$REGISTRY_BACKUP_PATH" "$LOCAL_SIGNING_IDENTITY_REGISTRY_PATH"
-    else
-        rm -f "$LOCAL_SIGNING_IDENTITY_REGISTRY_PATH"
+    if (( APP_BACKED_UP )); then
+        if [[ -e "$LOCAL_PRODUCTION_APP" || -L "$LOCAL_PRODUCTION_APP" ]]; then
+            rm -rf "$LOCAL_PRODUCTION_APP" || rollback_failed=1
+        fi
+        if [[ -n "$BACKUP_APP" && -e "$BACKUP_APP" ]]; then
+            mv "$BACKUP_APP" "$LOCAL_PRODUCTION_APP" || {
+                printf 'ERROR: Could not restore prior app from backup: %s\n' "$BACKUP_APP" >&2
+                rollback_failed=1
+            }
+            if [[ -e "$LOCAL_PRODUCTION_APP" ]]; then
+                APP_BACKED_UP=0
+                BACKUP_APP=""
+            fi
+        else
+            printf 'ERROR: Prior app backup is missing during rollback.\n' >&2
+            rollback_failed=1
+        fi
     fi
+    if [[ "${REGISTRY_NEEDS_WRITE:-0}" == "1" && "$REGISTRY_MUTATION_STARTED" == "1" ]]; then
+        if (( REGISTRY_EXISTED )); then
+            local registry_restore_path
+            registry_restore_path="$(dirname "$LOCAL_SIGNING_IDENTITY_REGISTRY_PATH")/.$(basename "$LOCAL_SIGNING_IDENTITY_REGISTRY_PATH").rollback.$$"
+            rm -f "$registry_restore_path"
+            if [[ ! -f "$REGISTRY_BACKUP_PATH" ]]; then
+                printf 'ERROR: Prior registry snapshot is missing during rollback.\n' >&2
+                rollback_failed=1
+                PRESERVE_TRANSACTION_SNAPSHOT=1
+            elif ! cp -p "$REGISTRY_BACKUP_PATH" "$registry_restore_path" ||
+                ! mv -f "$registry_restore_path" "$LOCAL_SIGNING_IDENTITY_REGISTRY_PATH"
+            then
+                rm -f "$registry_restore_path"
+                printf 'ERROR: Could not atomically restore prior local signing registry.\n' >&2
+                rollback_failed=1
+                PRESERVE_TRANSACTION_SNAPSHOT=1
+            fi
+        else
+            rm -f "$LOCAL_SIGNING_IDENTITY_REGISTRY_PATH" || {
+                printf 'ERROR: Could not remove newly created local signing registry.\n' >&2
+                rollback_failed=1
+            }
+        fi
+    fi
+    TRANSACTION_ACTIVE=0
+    return "$rollback_failed"
 }
 
 [[ "${CONFIRM_LOCAL_PRODUCTION_INSTALL:-}" == "1" ]] ||
@@ -255,46 +307,48 @@ ditto "$SOURCE_APP" "$STAGED_APP"
 codesign --verify --deep --strict --verbose=2 "$STAGED_APP"
 codesign --verify --deep --strict --verbose=2 -R="$LOCAL_SIGNING_REQUIREMENT" "$STAGED_APP"
 printf 'Installing fingerprint %s with designated requirement: %s\n' "$SELECTED_CERTIFICATE_SHA256" "$DESIGNATED_REQUIREMENT"
-if [[ -e "$LOCAL_PRODUCTION_APP" ]]; then
-    BACKUP_DIR="$(mktemp -d "$LOCAL_PRODUCTION_INSTALL_DIR/.$DISPLAY_NAME.app.backup.XXXXXX")"
-    BACKUP_APP="$BACKUP_DIR/$DISPLAY_NAME.app"
-    mv "$LOCAL_PRODUCTION_APP" "$BACKUP_APP"
-fi
-mv "$STAGED_APP" "$LOCAL_PRODUCTION_APP"
-STAGED_APP=""
-rmdir "$STAGED_DIR"
-STAGED_DIR=""
-
 if [[ "$REGISTRY_NEEDS_WRITE" == "1" ]]; then
     if [[ -e "$LOCAL_SIGNING_IDENTITY_REGISTRY_PATH" ]]; then
         cp -p "$LOCAL_SIGNING_IDENTITY_REGISTRY_PATH" "$REGISTRY_BACKUP_PATH"
         REGISTRY_EXISTED=1
     fi
+fi
+TRANSACTION_ACTIVE=1
+if [[ -e "$LOCAL_PRODUCTION_APP" ]]; then
+    BACKUP_DIR="$(mktemp -d "$LOCAL_PRODUCTION_INSTALL_DIR/.$DISPLAY_NAME.app.backup.XXXXXX")"
+    BACKUP_APP="$BACKUP_DIR/$DISPLAY_NAME.app"
+    mv "$LOCAL_PRODUCTION_APP" "$BACKUP_APP"
+    APP_BACKED_UP=1
+fi
+mv "$STAGED_APP" "$LOCAL_PRODUCTION_APP"
+APP_INSTALLED=1
+STAGED_APP=""
+rmdir "$STAGED_DIR"
+STAGED_DIR=""
+
+if [[ "$REGISTRY_NEEDS_WRITE" == "1" ]]; then
+    REGISTRY_MUTATION_STARTED=1
     if ! python3 "$LOCAL_SIGNING_IDENTITY_TOOL" write-registry \
         --path "$LOCAL_SIGNING_IDENTITY_REGISTRY_PATH" \
         --certificate-name "$LOCAL_SELF_SIGNED_CERTIFICATE_NAME" \
         --fingerprint "$SELECTED_CERTIFICATE_SHA256" \
         --generation "$LOCAL_SIGNING_SERVICE_GENERATION" >/dev/null
     then
-        rollback_installed_app
-        rollback_registry
-        fail "Could not atomically update the local signing identity registry; restored the prior app and registry."
+        fail "Could not atomically update the local signing identity registry; transaction will restore the prior app and registry."
     fi
 fi
-python3 "$LOCAL_SIGNING_IDENTITY_TOOL" read-registry --path "$LOCAL_SIGNING_IDENTITY_REGISTRY_PATH" >/dev/null || {
-    rollback_installed_app
-    if [[ "$REGISTRY_NEEDS_WRITE" == "1" ]]; then
-        rollback_registry
-    fi
-    fail "Installed app continuity registry could not be verified; restored the prior app and registry."
-}
+python3 "$LOCAL_SIGNING_IDENTITY_TOOL" read-registry --path "$LOCAL_SIGNING_IDENTITY_REGISTRY_PATH" >/dev/null ||
+    fail "Installed app continuity registry could not be verified; transaction will restore the prior app and registry."
+TRANSACTION_ACTIVE=0
 
 if [[ -n "$BACKUP_APP" ]]; then
     rm -rf "$BACKUP_APP"
     rmdir "$BACKUP_DIR"
     BACKUP_APP=""
     BACKUP_DIR=""
+    APP_BACKED_UP=0
 fi
+APP_INSTALLED=0
 
 printf 'Installed local self-signed production app: %s\n' "$LOCAL_PRODUCTION_APP"
 printf 'Registered local signing fingerprint: %s\n' "$SELECTED_CERTIFICATE_SHA256"

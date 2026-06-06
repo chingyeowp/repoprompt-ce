@@ -121,6 +121,10 @@ enum CLIPathInstaller {
                 managedDestinations: managedDestinations
             )
         }
+
+        static func test_atomicManagedWrapperInstallCommand(sourcePath: String, installPath: String) -> String {
+            atomicManagedWrapperInstallCommand(sourcePath: sourcePath, installPath: installPath)
+        }
     #endif
 
     // MARK: - Installation Status
@@ -518,7 +522,7 @@ enum CLIPathInstaller {
 
     private static func wrapperOwnershipFunction() -> String {
         let markers = ([ManagedCLIPathPolicy.currentClaudeWrapperMarker] + ManagedCLIPathPolicy.legacyClaudeWrapperMarkers)
-            .map { "grep -Fqx \(shellQuoted($0)) \"$candidate\"" }
+            .map { "head -n 8 \"$candidate\" | grep -Fqx \(shellQuoted($0))" }
             .joined(separator: " || ")
         return "managed_wrapper(){ candidate=\"$1\"; if [ -e \"$candidate\" ] || [ -L \"$candidate\" ]; then [ -f \"$candidate\" ] && [ ! -L \"$candidate\" ] || return 1; { \(markers); } || return 1; fi; }"
     }

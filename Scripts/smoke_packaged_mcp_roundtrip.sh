@@ -7,11 +7,14 @@ SMOKE_LABEL="${2:-Packaged MCP roundtrip}"
 ARTIFACT_MANIFEST="${3:-}"
 EXPECTED_ARCHITECTURES="${REPOPROMPT_EXPECTED_ARCHITECTURES:-arm64,x86_64}"
 ROUNDTRIP_TIMEOUT="${REPOPROMPT_PACKAGED_SMOKE_TIMEOUT:-60}"
+SOCKET_OWNER_HELPER="$SCRIPT_DIR/verify_packaged_mcp_socket_owner.py"
+MCP_SOCKET_DIR="${REPOPROMPT_PACKAGED_SMOKE_SOCKET_DIR:-/tmp/repoprompt-ce-mcp-$(id -u)}"
 APP_PID=""
 APP_COMMAND=""
 APP_START=""
 TEMP_ROOT=""
 APP_LOG=""
+MCP_SOCKET_PATH=""
 
 fail() {
     printf 'ERROR: %s\n' "$*" >&2
@@ -52,6 +55,7 @@ trap cleanup EXIT
 trap 'exit 130' INT TERM
 
 [[ -n "$APP_BUNDLE" ]] || fail "usage: $0 <app-bundle> [label] [artifact-manifest]"
+[[ -x "$SOCKET_OWNER_HELPER" ]] || fail "missing packaged MCP socket ownership verifier: $SOCKET_OWNER_HELPER"
 "$SCRIPT_DIR/validate_embedded_mcp_helper_layout.sh" "$APP_BUNDLE" "$SMOKE_LABEL layout"
 "$SCRIPT_DIR/validate_app_architectures.sh" "$APP_BUNDLE" "$EXPECTED_ARCHITECTURES" "$SMOKE_LABEL architectures"
 if [[ -n "$ARTIFACT_MANIFEST" ]]; then
@@ -91,6 +95,9 @@ ISOLATED_TMP="$TEMP_ROOT/tmp"
 APP_LOG="$TEMP_ROOT/app.log"
 mkdir -p "$ISOLATED_HOME" "$ISOLATED_TMP"
 chmod 700 "$TEMP_ROOT" "$ISOLATED_HOME" "$ISOLATED_TMP"
+
+"$SOCKET_OWNER_HELPER" preflight "$MCP_SOCKET_DIR" ||
+    fail "$SMOKE_LABEL requires no pre-existing live release MCP socket in $MCP_SOCKET_DIR"
 
 MINIMAL_PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 APP_COMMAND="$APP_EXECUTABLE"
@@ -154,15 +161,37 @@ PYTHON
 }
 
 deadline=$(( $(date +%s) + ROUNDTRIP_TIMEOUT ))
-last_status=1
+last_status=75
 while (( $(date +%s) <= deadline )); do
     process_matches || fail "packaged app exited before MCP bootstrap completed"
+    if [[ -z "$MCP_SOCKET_PATH" ]]; then
+        set +e
+        MCP_SOCKET_PATH="$("$SOCKET_OWNER_HELPER" find-owner "$MCP_SOCKET_DIR" "$APP_PID" "$APP_EXECUTABLE" 2>"$TEMP_ROOT/socket-owner.err")"
+        owner_status=$?
+        set -e
+        if (( owner_status == 75 )); then
+            MCP_SOCKET_PATH=""
+            sleep 1
+            continue
+        fi
+        if (( owner_status != 0 )); then
+            cat "$TEMP_ROOT/socket-owner.err" >&2 || true
+            fail "$SMOKE_LABEL could not prove the launched app owns the release MCP socket"
+        fi
+        [[ -n "$MCP_SOCKET_PATH" ]] || fail "$SMOKE_LABEL ownership verifier returned an empty socket path"
+    fi
+
+    "$SOCKET_OWNER_HELPER" verify-owner "$MCP_SOCKET_PATH" "$APP_PID" "$APP_EXECUTABLE" ||
+        fail "$SMOKE_LABEL launched app no longer owns the release MCP socket: $MCP_SOCKET_PATH"
     set +e
     run_windows_request
     last_status=$?
     set -e
     if (( last_status == 0 )); then
-        printf 'OK: %s completed bootstrap and windows request with exact helper: %s\n' "$SMOKE_LABEL" "$MCP_HELPER"
+        "$SOCKET_OWNER_HELPER" verify-owner "$MCP_SOCKET_PATH" "$APP_PID" "$APP_EXECUTABLE" ||
+            fail "$SMOKE_LABEL release MCP socket ownership changed during the helper request"
+        printf 'OK: %s completed bootstrap and windows request with exact helper %s against launched pid %s socket %s\n' \
+            "$SMOKE_LABEL" "$MCP_HELPER" "$APP_PID" "$MCP_SOCKET_PATH"
         exit 0
     fi
     (( last_status == 1 || last_status == 124 )) ||
