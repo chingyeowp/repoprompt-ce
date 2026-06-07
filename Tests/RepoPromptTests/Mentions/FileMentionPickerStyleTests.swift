@@ -19,7 +19,7 @@ final class FileMentionPickerStyleTests: XCTestCase {
         let configuration = FileMentionPickerStyle.expanded.configuration
         XCTAssertEqual(configuration.maxResults, 99)
         XCTAssertEqual(configuration.visibleRows, 15)
-        XCTAssertEqual(configuration.overlayWidth, 480)
+        XCTAssertEqual(configuration.overlayWidth, 720)
         XCTAssertTrue(configuration.showsFileSubtitles)
     }
 
