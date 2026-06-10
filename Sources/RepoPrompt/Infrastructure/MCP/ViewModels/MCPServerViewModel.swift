@@ -762,7 +762,7 @@ final class MCPServerViewModel: ObservableObject {
         },
         performFileAction: { [weak self] action, path, content, newPath, ifExists in
             guard let self else { throw MCPError.internalError("Window deallocated while performing file action") }
-            try await performFileAction(action: action, path: path, content: content, newPath: newPath, ifExists: ifExists)
+            return try await performFileAction(action: action, path: path, content: content, newPath: newPath, ifExists: ifExists)
         },
         buildCodeStructureDTO: { [weak self] files, maxResults, includeUnmappedPaths, projection in
             guard let self else { throw MCPError.internalError("Window deallocated while building code structure") }
@@ -3730,7 +3730,7 @@ final class MCPServerViewModel: ObservableObject {
         content: String? = nil,
         newPath: String? = nil,
         ifExists: String? = nil
-    ) async throws {
+    ) async throws -> String? {
         // Enforce workspace presence in multi-window mode
         try await requireWorkspaceForTool(MCPWindowToolName.fileActions)
         let metadata = await captureRequestMetadata()
@@ -3816,17 +3816,22 @@ final class MCPServerViewModel: ObservableObject {
                 mode: "full",
                 lookupRootScope: lookupContext.rootScope
             )
-            guard addResult.selection != resolvedContext.snapshot.selection else { return }
+            guard addResult.selection != resolvedContext.snapshot.selection else { return nil }
             resolvedContext.snapshot.selection = addResult.selection
             let verification = await persistResolvedTabContextSnapshot(resolvedContext, metadata: metadata, mutated: true)
-            _ = try MCPSelectionToolProvider.requireCanonicalSelection(
-                verification,
-                requested: addResult.selection,
-                tabID: resolvedContext.snapshot.tabID,
-                operation: "file_actions create selection update",
-                recovery: "The file was created, but its selection was not confirmed; retry manage_selection for the same context_id."
-            )
+            do {
+                _ = try MCPSelectionToolProvider.requireCanonicalSelection(
+                    verification,
+                    requested: addResult.selection,
+                    tabID: resolvedContext.snapshot.tabID,
+                    operation: "file_actions create selection update",
+                    recovery: "Retry manage_selection for the same context_id."
+                )
+            } catch {
+                return "The file was created, but its selection was not confirmed. \(error)"
+            }
         }
+        return nil
     }
 
     /// Creates a **new** file, with optional overwrite behavior.

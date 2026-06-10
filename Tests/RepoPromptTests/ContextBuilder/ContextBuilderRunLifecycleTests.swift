@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 @testable import RepoPrompt
 import XCTest
@@ -315,8 +316,19 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
 
     func testMCPRoutingFailureAfterImmediateStreamReturnCleansBootstrapAndAllowsImmediateRetry() async throws {
         #if DEBUG
+            let oldProcess = try makeSleepingProcessTree()
+            let retryProcess = try makeSleepingProcessTree()
+            defer {
+                oldProcess.terminate()
+                retryProcess.terminate()
+            }
+            let clientName = AgentProviderKind.codexExec.mcpClientNameHint ?? AgentProviderKind.codexMCPClientID
             let blockedProvider = CodexShapedBlockedRoutingTestProvider()
-            let retryProvider = ImmediateSuccessRoutingTestProvider()
+            let retryProvider = PIDOwnedRetryRoutingTestProvider(
+                clientName: clientName,
+                expectedParentPID: retryProcess.parentPID,
+                connectionPID: retryProcess.childPID
+            )
             let providers = LifecycleTestProviderQueue([blockedProvider, retryProvider])
             let previousMCPEnabled = await ServerNetworkManager.shared.debugIsEnabledForBootstrapSocketURLOverride()
 
@@ -331,6 +343,9 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
             )
             GlobalSettingsStore.shared.setMCPAutoStart(previousMCPAutoStart, commit: false)
             await composition.workspaceManager.awaitInitialized()
+            var firstRunID: UUID?
+            var retryRunID: UUID?
+            let lateConnectionID = UUID()
 
             do {
                 let workspaceRoot = FileManager.default.temporaryDirectory
@@ -368,7 +383,6 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
                 }
 
                 let firstTeardownCompleted = expectation(description: "failed provider teardown completed")
-                var firstRunID: UUID?
                 viewModel.installRunTestHooks(
                     ContextBuilderAgentViewModel.RunTestHooks(
                         beforeProcessingProviderEvent: nil,
@@ -399,6 +413,11 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
                 await blockedProvider.waitUntilInternalStartupEntered()
                 firstRunID = try XCTUnwrap(viewModel.activeRunIDForTesting(tabID: tabID))
                 let failedRunID = try XCTUnwrap(firstRunID)
+                await ServerNetworkManager.shared.registerExpectedAgentPID(
+                    oldProcess.parentPID,
+                    for: clientName,
+                    runID: failedRunID
+                )
                 let routingWaiterRegistered = await waitForRoutingWaiter(runID: failedRunID)
                 XCTAssertTrue(routingWaiterRegistered)
                 await MCPRoutingWaiter.notifyFailed(runID: failedRunID)
@@ -428,25 +447,52 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
                 XCTAssertNil(activeGateID)
                 XCTAssertEqual(waitingGateCount, 0)
                 XCTAssertEqual(routingWaiterCount, 0)
-                if let clientName = AgentProviderKind.codexExec.mcpClientNameHint {
-                    let pendingPolicies = await ServerNetworkManager.shared.debugPendingPolicySnapshot(
-                        for: clientName
-                    )
-                    XCTAssertFalse(pendingPolicies.contains { $0.runID == failedRunID })
-                }
+                let pendingPoliciesAfterFailure = await ServerNetworkManager.shared.debugPendingPolicySnapshot(
+                    for: clientName
+                )
+                XCTAssertFalse(pendingPoliciesAfterFailure.contains { $0.runID == failedRunID })
 
                 let retryToken = try viewModel.beginMCPControlledRun(
                     forTabID: tabID,
                     responseType: nil,
                     planModelName: nil
                 )
-                let retrySnapshot = try await viewModel.runContextBuilderForMCP(
-                    tabID: tabID,
-                    mcpControlToken: retryToken
-                )
+                let retryWaiter = Task { @MainActor in
+                    try await viewModel.runContextBuilderForMCP(
+                        tabID: tabID,
+                        mcpControlToken: retryToken
+                    )
+                }
 
+                await retryProvider.waitUntilConnectionAttemptReady()
+                retryRunID = try XCTUnwrap(viewModel.activeRunIDForTesting(tabID: tabID))
+                let successorRunID = try XCTUnwrap(retryRunID)
+                let lateOldProviderConnection = await ServerNetworkManager.shared.debugApplyPendingPolicy(
+                    clientName: clientName,
+                    connectionID: lateConnectionID,
+                    clientPid: Int(oldProcess.childPID),
+                    bootstrapClientName: "repoprompt_ce_cli_debug",
+                    pidGateTimeout: 0.05,
+                    requireRunRouting: false
+                )
+                XCTAssertEqual(lateOldProviderConnection.outcome, "rejected:ownership_timeout")
+                XCTAssertEqual(lateOldProviderConnection.runID, successorRunID)
+                let lateMappedRunID = await ServerNetworkManager.shared.runIDForConnection(lateConnectionID)
+                XCTAssertNil(lateMappedRunID)
+                let pendingPoliciesAfterLateOldConnection = await ServerNetworkManager.shared.debugPendingPolicySnapshot(
+                    for: clientName
+                )
+                XCTAssertTrue(pendingPoliciesAfterLateOldConnection.contains { $0.runID == successorRunID })
+
+                await retryProvider.releaseConnectionAttempt()
+                let retrySnapshot = try await retryWaiter.value
+                let retryPolicyApplication = await retryProvider.policyApplicationResult()
+
+                XCTAssertEqual(retryPolicyApplication?.outcome, "applied")
+                XCTAssertEqual(retryPolicyApplication?.runID, successorRunID)
                 XCTAssertEqual(retrySnapshot.runState, .completed)
                 XCTAssertEqual(retrySnapshot.agentOutput, "retry-success")
+                XCTAssertEqual(retrySnapshot.runID, successorRunID)
                 XCTAssertNotEqual(retrySnapshot.runID, failedRunID)
                 XCTAssertTrue(viewModel.isRunTeardownPendingForTesting(runID: failedRunID))
                 let disposeCallCountAfterRetry = await blockedProvider.disposeCallCount()
@@ -457,12 +503,41 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
                 await fulfillment(of: [firstTeardownCompleted], timeout: 1)
                 XCTAssertFalse(viewModel.isRunTeardownPendingForTesting(runID: failedRunID))
 
+                await ServerNetworkManager.shared.clearExpectedAgentPID(
+                    oldProcess.parentPID,
+                    for: clientName,
+                    runID: failedRunID
+                )
+                await ServerNetworkManager.shared.clearExpectedAgentPID(
+                    retryProcess.parentPID,
+                    for: clientName,
+                    runID: successorRunID
+                )
+                await ServerNetworkManager.shared.removeConnection(lateConnectionID)
+                await ServerNetworkManager.shared.removeConnection(retryProvider.connectionID)
                 await composition.mcpServer.stopServer()
                 await composition.mcpServer.shutdownListener()
                 await ServerNetworkManager.shared.setEnabled(previousMCPEnabled)
             } catch {
                 await blockedProvider.releaseInternalStartup()
                 await blockedProvider.releaseDisposal()
+                await retryProvider.releaseConnectionAttempt()
+                if let firstRunID {
+                    await ServerNetworkManager.shared.clearExpectedAgentPID(
+                        oldProcess.parentPID,
+                        for: clientName,
+                        runID: firstRunID
+                    )
+                }
+                if let retryRunID {
+                    await ServerNetworkManager.shared.clearExpectedAgentPID(
+                        retryProcess.parentPID,
+                        for: clientName,
+                        runID: retryRunID
+                    )
+                }
+                await ServerNetworkManager.shared.removeConnection(lateConnectionID)
+                await ServerNetworkManager.shared.removeConnection(retryProvider.connectionID)
                 await composition.mcpServer.stopServer()
                 await composition.mcpServer.shutdownListener()
                 await ServerNetworkManager.shared.setEnabled(previousMCPEnabled)
@@ -482,6 +557,66 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
         }
         return false
     }
+
+    #if DEBUG
+        private struct SleepingProcessTree {
+            let parent: Process
+            let childPID: pid_t
+            let parentExited: DispatchSemaphore
+
+            var parentPID: pid_t {
+                parent.processIdentifier
+            }
+
+            func terminate() {
+                _ = Darwin.kill(childPID, SIGTERM)
+                _ = Darwin.kill(parentPID, SIGTERM)
+                guard parentExited.wait(timeout: .now() + 0.25) == .timedOut else {
+                    parent.waitUntilExit()
+                    return
+                }
+
+                _ = Darwin.kill(childPID, SIGKILL)
+                _ = Darwin.kill(parentPID, SIGKILL)
+                if parentExited.wait(timeout: .now() + 1.0) == .success {
+                    parent.waitUntilExit()
+                }
+            }
+        }
+
+        private func makeSleepingProcessTree() throws -> SleepingProcessTree {
+            let process = Process()
+            let stdout = Pipe()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            process.arguments = [
+                "python3",
+                "-c",
+                "import subprocess; child=subprocess.Popen(['/bin/sleep','30']); print(child.pid, flush=True); child.wait()"
+            ]
+            process.standardOutput = stdout
+            let parentExited = DispatchSemaphore(value: 0)
+            process.terminationHandler = { _ in parentExited.signal() }
+            try process.run()
+            var data = Data()
+            while data.count < 32 {
+                guard let byte = try stdout.fileHandleForReading.read(upToCount: 1), !byte.isEmpty else { break }
+                if byte == Data([0x0A]) { break }
+                data.append(byte)
+            }
+            guard let text = String(data: data, encoding: .utf8),
+                  let childPID = pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines))
+            else {
+                process.terminate()
+                process.waitUntilExit()
+                throw NSError(
+                    domain: "ContextBuilderRunLifecycleTests",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "Failed to read child PID from process-tree fixture."]
+                )
+            }
+            return SleepingProcessTree(parent: process, childPID: childPID, parentExited: parentExited)
+        }
+    #endif
 
     private func makeRecord(
         tabID: UUID,
@@ -756,14 +891,59 @@ private final class CodexShapedBlockedRoutingTestProvider: HeadlessAgentProvider
     }
 }
 
-private final class ImmediateSuccessRoutingTestProvider: HeadlessAgentProvider {
+private final class PIDOwnedRetryRoutingTestProvider: HeadlessAgentProvider {
+    struct PolicyApplicationResult {
+        let outcome: String
+        let runID: UUID?
+    }
+
+    let connectionID = UUID()
+    private let clientName: String
+    private let expectedParentPID: pid_t
+    private let connectionPID: pid_t
+    private let connectionAttemptReady = LifecycleTestGate()
+    private let connectionAttemptRelease = LifecycleTestGate()
+    private let state = PIDOwnedRetryRoutingTestState()
+
+    init(clientName: String, expectedParentPID: pid_t, connectionPID: pid_t) {
+        self.clientName = clientName
+        self.expectedParentPID = expectedParentPID
+        self.connectionPID = connectionPID
+    }
+
     func streamAgentMessage(
         _ message: AgentMessage,
         runID: UUID?
     ) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
         _ = message
         guard let runID else { throw CancellationError() }
-        await MCPRoutingWaiter.notifyRouted(runID: runID)
+        await connectionAttemptReady.arrive()
+        await connectionAttemptRelease.arriveAndWait()
+        #if DEBUG
+            await ServerNetworkManager.shared.registerExpectedAgentPID(
+                expectedParentPID,
+                for: clientName,
+                runID: runID
+            )
+            let result = await ServerNetworkManager.shared.debugApplyPendingPolicy(
+                clientName: clientName,
+                connectionID: connectionID,
+                clientPid: Int(connectionPID),
+                bootstrapClientName: "repoprompt_ce_cli_debug",
+                pidGateTimeout: 0.25,
+                requireRunRouting: false
+            )
+            await state.record(
+                PolicyApplicationResult(outcome: result.outcome, runID: result.runID)
+            )
+            if result.outcome == "applied", result.runID == runID {
+                await MCPRoutingWaiter.notifyRouted(runID: runID)
+            } else {
+                await MCPRoutingWaiter.notifyFailed(runID: runID)
+            }
+        #else
+            throw CancellationError()
+        #endif
         return AsyncThrowingStream { continuation in
             continuation.yield(AIStreamResult(type: "content", text: "retry-success"))
             continuation.finish()
@@ -771,6 +951,26 @@ private final class ImmediateSuccessRoutingTestProvider: HeadlessAgentProvider {
     }
 
     func dispose() async {}
+
+    func waitUntilConnectionAttemptReady() async {
+        await connectionAttemptReady.waitUntilArrived()
+    }
+
+    func releaseConnectionAttempt() async {
+        await connectionAttemptRelease.release()
+    }
+
+    func policyApplicationResult() async -> PolicyApplicationResult? {
+        await state.result
+    }
+}
+
+private actor PIDOwnedRetryRoutingTestState {
+    private(set) var result: PIDOwnedRetryRoutingTestProvider.PolicyApplicationResult?
+
+    func record(_ result: PIDOwnedRetryRoutingTestProvider.PolicyApplicationResult) {
+        self.result = result
+    }
 }
 
 private actor CodexShapedBlockedRoutingTestState {
