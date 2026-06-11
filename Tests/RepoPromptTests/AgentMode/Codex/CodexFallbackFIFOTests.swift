@@ -39,6 +39,29 @@ final class CodexFallbackFIFOTests: XCTestCase {
         XCTAssertEqual(session.codexAuthoritativeActiveTurn?.turnID, "turn")
     }
 
+    func testSteerAcceptedIntoDifferentTurnReconcilesWithoutResend() async {
+        let controller = FallbackFIFOController(
+            steerResults: [.success(.init(acceptedTurnID: "actual-turn"))]
+        )
+        let (viewModel, session) = makeRunningSession(controller: controller)
+
+        let outcome = await viewModel.test_codexCoordinator.sendCodexNativeMessage(
+            session: session,
+            text: "steer me",
+            attachments: []
+        )
+
+        XCTAssertEqual(outcome, .sent)
+        XCTAssertEqual(controller.steerTurnIDs, ["turn"])
+        XCTAssertEqual(controller.startCount, 0)
+        XCTAssertTrue(session.codexFallbackQueue.isEmpty)
+        XCTAssertEqual(session.codexPendingSteerLifecycleReconciliation?.priorIdentity.turnID, "turn")
+        XCTAssertEqual(
+            session.codexPendingSteerLifecycleReconciliation?.acceptedDispatchTurnID,
+            "actual-turn"
+        )
+    }
+
     func testMismatchRetrySuccessReconcilesOnlyWhenActualLifecycleCompletes() async {
         let mismatch = requestFailure(message: "expected turn mismatch")
         let controller = FallbackFIFOController(

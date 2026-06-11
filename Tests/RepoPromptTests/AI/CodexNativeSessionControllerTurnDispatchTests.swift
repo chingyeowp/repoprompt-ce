@@ -65,7 +65,7 @@ final class CodexNativeSessionControllerTurnDispatchTests: XCTestCase {
         XCTAssertEqual(controller.test_authoritativeLifecycleTurnID, "turn-1")
     }
 
-    func testTurnSteerAcceptedMismatchThrowsTypedMismatchError() async throws {
+    func testTurnSteerAcceptedMismatchReturnsAcceptedReceiptWithoutResend() async throws {
         let recorder = TurnRequestRecorder(result: [
             "turnId": "turn-2"
         ])
@@ -76,17 +76,14 @@ final class CodexNativeSessionControllerTurnDispatchTests: XCTestCase {
             routingTurnID: "turn-1"
         )
 
-        do {
-            _ = try await controller.steerUserTurn(
-                text: "adjust course",
-                images: [],
-                expectedTurnID: "turn-1"
-            )
-            XCTFail("Expected steer to throw on accepted turn mismatch")
-        } catch let CodexTurnSteerError.expectedTurnMismatch(expected, actual, _) {
-            XCTAssertEqual(expected, "turn-1")
-            XCTAssertEqual(actual, "turn-2")
-        }
+        let receipt = try await controller.steerUserTurn(
+            text: "adjust course",
+            images: [],
+            expectedTurnID: "turn-1"
+        )
+
+        XCTAssertEqual(receipt.acceptedTurnID, "turn-2")
+        XCTAssertEqual(recorder.requests().count, 1)
     }
 
     func testStructuredSteerErrorsMapWithoutLosingJSONRPCPayload() async throws {

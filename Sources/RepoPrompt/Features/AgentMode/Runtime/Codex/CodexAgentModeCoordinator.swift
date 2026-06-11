@@ -1888,6 +1888,42 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         session.codexPendingSteerLifecycleReconciliation = nil
     }
 
+    /// A steer the server accepted into a different turn already delivered the
+    /// user's input, so this rebinds lifecycle identity without resending.
+    private func reconcileAcceptedCodexSteerMismatch(
+        from identity: AgentModeViewModel.TabSession.CodexAuthoritativeTurnIdentity,
+        acceptedTurnID: String,
+        controller: any CodexSessionControlling,
+        session: AgentModeViewModel.TabSession
+    ) async {
+        guard session.codexAuthoritativeActiveTurn == identity,
+              authoritativeCodexTurnIsCurrent(identity, session: session),
+              session.codexController.map(ObjectIdentifier.init) == ObjectIdentifier(controller)
+        else { return }
+        logCodex(
+            "[AgentModeVM] sendCodexNativeMessage: steer accepted into different turn expected=\(identity.turnID) actual=\(acceptedTurnID); reconciling without resend"
+        )
+        let reconciliation = AgentModeViewModel.TabSession.CodexPendingSteerLifecycleReconciliation(
+            priorIdentity: identity,
+            acceptedDispatchTurnID: acceptedTurnID
+        )
+        session.codexPendingSteerLifecycleReconciliation = reconciliation
+        let prepared = await controller.prepareLifecycleAuthorityReconciliationAfterAcceptedMismatch(
+            expectedCurrentTurnID: identity.turnID,
+            acceptedDispatchTurnID: acceptedTurnID
+        )
+        if !prepared {
+            logCodex(
+                "[AgentModeVM] sendCodexNativeMessage: controller lifecycle authority unavailable for accepted steer turn=\(acceptedTurnID); relying on session-level reconciliation"
+            )
+        }
+        if session.codexPendingSteerLifecycleReconciliation == reconciliation,
+           session.codexAuthoritativeActiveTurn != identity
+        {
+            session.codexPendingSteerLifecycleReconciliation = nil
+        }
+    }
+
     private func codexFallbackBlockingTurn(
         for identity: AgentModeViewModel.TabSession.CodexAuthoritativeTurnIdentity
     ) -> AgentModeViewModel.TabSession.CodexFallbackBlockingTurn {
@@ -4236,11 +4272,19 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             case let .steer(identity):
                 logCodex("[AgentModeVM] sendCodexNativeMessage: calling controller.steerUserTurn expectedTurnID=\(identity.turnID)")
                 do {
-                    _ = try await controller.steerUserTurn(
+                    let receipt = try await controller.steerUserTurn(
                         text: text,
                         images: attachments,
                         expectedTurnID: identity.turnID
                     )
+                    if receipt.acceptedTurnID != identity.turnID {
+                        await reconcileAcceptedCodexSteerMismatch(
+                            from: identity,
+                            acceptedTurnID: receipt.acceptedTurnID,
+                            controller: controller,
+                            session: session
+                        )
+                    }
                 } catch let mismatch as CodexTurnSteerError {
                     guard case let .expectedTurnMismatch(expectedTurnID, actualTurnID, failure) = mismatch,
                           let actualTurnID = actualTurnID?.trimmingCharacters(in: .whitespacesAndNewlines),

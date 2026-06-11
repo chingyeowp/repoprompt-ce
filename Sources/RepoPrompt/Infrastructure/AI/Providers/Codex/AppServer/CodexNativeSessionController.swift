@@ -1254,18 +1254,8 @@ final class CodexNativeSessionController {
             ) else {
                 throw CodexAppServerClient.ClientError.invalidResponse
             }
-            guard acceptedTurnID == expectedTurnID else {
-                throw CodexTurnSteerError.expectedTurnMismatch(
-                    expectedTurnID: expectedTurnID,
-                    actualTurnID: acceptedTurnID,
-                    failure: CodexAppServerClient.RequestFailure(
-                        method: "turn/steer",
-                        code: nil,
-                        message: "Codex accepted turn/steer for turn \(acceptedTurnID) instead of expected turn \(expectedTurnID).",
-                        data: nil
-                    )
-                )
-            }
+            // An accepted steer with a different turn ID still delivered the input;
+            // callers reconcile identity from the receipt instead of retrying.
             return CodexTurnSteerReceipt(acceptedTurnID: acceptedTurnID)
         } catch let error as CodexAppServerClient.ClientError {
             throw Self.mapSteerRequestError(error, expectedTurnID: expectedTurnID)
