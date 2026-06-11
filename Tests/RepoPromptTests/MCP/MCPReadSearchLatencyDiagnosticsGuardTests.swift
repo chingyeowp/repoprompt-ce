@@ -2026,11 +2026,8 @@
             let viewModel = try source("Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel.swift")
             for hook in [
                 "resolveReadableFile",
-                "exactPathIssueDetection",
                 "rootRefsLookup",
-                "folderResolution",
-                "externalFolderGuard",
-                "readableServiceResolution"
+                "resolveReadFileRequest"
             ] {
                 XCTAssertTrue(viewModel.contains(hook), "Missing view-model read-resolution hook: \(hook)")
             }
@@ -2040,7 +2037,8 @@
                 "exactCatalogLookupAwait",
                 "explicitMaterialization",
                 "generalLookupFallback",
-                "externalFileFallback"
+                "externalFileFallback",
+                "allowGeneralLookupFallback: false"
             ] {
                 XCTAssertTrue(readableService.contains(hook), "Missing readable-service resolution hook: \(hook)")
             }
@@ -2056,7 +2054,8 @@
         func testReadResolutionDecompositionAvoidsOrdinaryReleaseOutcomeBookkeeping() throws {
             let viewModel = try source("Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel.swift")
             XCTAssertFalse(viewModel.contains("let readableServiceOutcome ="))
-            XCTAssertTrue(viewModel.contains("Dimensions(outcome: {\n                    switch readableFile"))
+            XCTAssertTrue(viewModel.contains("switch resolution"))
+            XCTAssertTrue(viewModel.contains("case let .readable(handle):"))
 
             let readableService = try source("Sources/RepoPrompt/Infrastructure/WorkspaceContext/WorkspaceReadableFileService.swift")
             XCTAssertFalse(readableService.contains("let exactCatalogLookupOutcome ="))
@@ -2074,23 +2073,33 @@
             XCTAssertTrue(store.contains("#if DEBUG || EDIT_FLOW_PERF\n                exactCatalogLookupOutcome ="))
         }
 
-        func testSearchCatalogSnapshotCacheRemainsBoundedGenerationKeyedAndCoarselyDiagnosed() throws {
+        func testSearchCatalogSnapshotCacheUsesSelectiveDependencyKeyedEviction() throws {
             let store = try source("Sources/RepoPrompt/Infrastructure/WorkspaceContext/WorkspaceFileContextStore.swift")
             XCTAssertTrue(store.contains("private static let maxCachedSearchCatalogSnapshotScopes = 16"))
             XCTAssertTrue(store.contains("private var searchCatalogSnapshotsByScope: [WorkspaceLookupRootScope: SearchCatalogSnapshotCacheEntry] = [:]"))
-            XCTAssertTrue(store.contains("case .sessionBoundWorkspace:\n            scopedSnapshotGeneration(scope: .allLoaded)"))
-            XCTAssertTrue(store.contains("rootStatesByID[originalRootID] = state\n            clearSearchCatalogSnapshotCache(\n                reasons: [.explicitMaterialization]"))
+            XCTAssertTrue(store.contains("let lifetimeID: UUID"))
+            XCTAssertTrue(store.contains("generation: catalogGenerationsByRootID[root.id] ?? 0"))
+            XCTAssertTrue(store.contains("dependencies: dependencies"))
+            XCTAssertFalse(store.contains("case .sessionBoundWorkspace:\n            scopedSnapshotGeneration(scope: .allLoaded)"))
+            XCTAssertTrue(store.contains("lastAccessSequence: nextSearchCatalogAccessSequence()"))
+            XCTAssertTrue(store.contains("searchCatalogSnapshotsByScope.min(by:"))
+            XCTAssertTrue(store.contains("scopes: [eviction.key]"))
+            XCTAssertFalse(store.contains("searchCatalogSnapshotsByScope.removeAll(keepingCapacity: true)"))
+            XCTAssertFalse(store.contains("clearSearchCatalogSnapshotCache"))
+            XCTAssertFalse(store.contains("rootStatesByID[eligible.rootID] = state\n            evict"))
             assertSourceOrder(
                 in: store,
                 hooks: [
                     "guard !statesToUnload.isEmpty else { return }",
-                    "clearSearchCatalogSnapshotCache(\n            reasons: [.rootUnload]",
+                    "invalidatePathMatchSnapshot(\n            affectedRootKinds: Set(statesToUnload.map(\\.state.root.kind))",
                     "await searchDecodedContentCache.invalidate(rootID: entry.rootID)",
-                    "#if DEBUG"
+                    "finishRootUnload(for: unloadingPaths)"
                 ]
             )
-            XCTAssertTrue(store.contains("bumpCatalogGenerations(affectedRootKinds: affectedRootKinds)\n        clearSearchCatalogSnapshotCache(\n            reasons: reasons"))
-            XCTAssertTrue(store.contains("#endif\n        invalidatePathMatchCache()\n        finishRootUnload(for: unloadingPaths)"))
+            XCTAssertTrue(store.contains("bumpCatalogGenerations(\n            affectedRootKinds: affectedRootKinds,\n            affectedRootIDs: affectedRootIDs"))
+            XCTAssertTrue(store.contains("evictInvalidSearchCatalogSnapshots("))
+            XCTAssertTrue(store.contains("invalidatePathMatchCache(snapshotIdentities: stalePathMatchIdentities)"))
+            XCTAssertFalse(store.contains("#endif\n        invalidatePathMatchCache()\n        finishRootUnload(for: unloadingPaths)"))
             XCTAssertTrue(store.contains("cacheHit: true"))
             XCTAssertTrue(store.contains("cacheHit: false"))
             XCTAssertFalse(store.contains("Dimensions(rootScope:"))
@@ -2562,13 +2571,11 @@
             assertSourceOrder(
                 in: server,
                 hooks: [
-                    "EditFlowPerf.Stage.ReadFile.exactCatalogShortcut",
-                    "resolveExactWorkspaceCatalogHit(path, rootScope: lookupRootScope)",
-                    "EditFlowPerf.Lifecycle.ReadFile.exactCatalogShortcutResolved",
-                    "if let exactCatalogHit"
+                    "let roots = await store.rootRefs(scope: lookupRootScope)",
+                    "await readableService.awaitFreshnessForExplicitRequest(path, rootRefs: roots)",
+                    "await readableService.resolveReadFileRequest("
                 ]
             )
-
             let provider = try source("Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPFileToolProvider.swift")
             assertSourceOrder(
                 in: provider,
@@ -2840,8 +2847,9 @@
                 in: server,
                 hooks: [
                     "let readableService = WorkspaceReadableFileService(store: store)",
-                    "try await readableService.awaitFreshnessForExplicitRequest(path, fallbackScope: lookupRootScope)",
-                    "let exactPathIssueDetection = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.exactPathIssueDetection)"
+                    "let roots = await store.rootRefs(scope: lookupRootScope)",
+                    "try await readableService.awaitFreshnessForExplicitRequest(path, rootRefs: roots)",
+                    "await readableService.resolveReadFileRequest("
                 ]
             )
             let search = try source("Sources/RepoPrompt/Features/Search/StoreBackedWorkspaceSearch.swift")
@@ -2854,6 +2862,61 @@
             )
             let workspaceFiles = try source("Sources/RepoPrompt/Features/WorkspaceFiles/ViewModels/WorkspaceFilesViewModel.swift")
             XCTAssertEqual(workspaceFiles.components(separatedBy: "awaitAppliedIngressForAllRoots()").count - 1, 2)
+        }
+
+        func testReadFileWI7CacheFreshnessAndRequestReuseBoundariesRemainExplicit() throws {
+            let cache = try source("Sources/RepoPrompt/Infrastructure/WorkspaceContext/WorkspaceInteractiveReadCache.swift")
+            XCTAssertTrue(cache.contains("rootLifetimeID: UUID"))
+            XCTAssertTrue(cache.contains("fingerprint: FileContentFingerprint"))
+            XCTAssertTrue(cache.contains("invalidationEpoch: UInt64"))
+            XCTAssertTrue(cache.contains("maxEstimatedCost: Int = 64 * 1024 * 1024"))
+            XCTAssertTrue(cache.contains("Task.detached(priority: priority)"))
+
+            let store = try source("Sources/RepoPrompt/Infrastructure/WorkspaceContext/WorkspaceFileContextStore.swift")
+            XCTAssertTrue(store.contains("completedScopedIngressBarrierCutsByRootID"))
+            XCTAssertTrue(store.contains("applied.appliedWatcherWatermark >= target.watcherAcceptedWatermark"))
+            XCTAssertTrue(store.contains("applied.appliedServicePublicationSequence >= target.acceptedServicePublicationSequence"))
+            XCTAssertTrue(store.contains("interactiveReadCache.invalidate(searchContentInvalidations)"))
+            XCTAssertTrue(store.contains("rootLifetimeID: state.lifetimeID"))
+
+            let server = try source("Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel.swift")
+            XCTAssertTrue(server.contains("WorkspaceInteractiveReadProcessor.sliceOffActor"))
+            XCTAssertFalse(server.contains("String.splitContentPreservingAllLineEndings(full)"))
+
+            let tabContext = try source("Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel+TabContext.swift")
+            let lookupStart = try XCTUnwrap(tabContext.range(of: "    func resolveFileToolLookupContext(\n"))
+            let lookupEnd = try XCTUnwrap(tabContext.range(
+                of: "    @MainActor\n    func materializeWorkspaceBindingProjection",
+                range: lookupStart.upperBound ..< tabContext.endIndex
+            ))
+            let lookupContext = String(tabContext[lookupStart.lowerBound ..< lookupEnd.lowerBound])
+            XCTAssertTrue(lookupContext.contains("let purpose = metadata.runPurpose ?? .unknown"))
+            XCTAssertFalse(lookupContext.contains("ServerNetworkManager.shared.runPurpose"))
+        }
+
+        func testGitProviderKeepsWI5ResolutionBuildAndIngressNarrowing() throws {
+            let provider = try source("Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPGitToolProvider.swift")
+            XCTAssertEqual(
+                provider.components(separatedBy: "workspaceFileContextStore.rootRefs(scope: lookupContext.rootScope)").count - 1,
+                1
+            )
+            XCTAssertTrue(provider.contains("MCPGitRequestContext(rootRefs: visibleRoots, vcsService: vcsService)"))
+            XCTAssertFalse(provider.contains("resolveDefaultGitRepo"))
+            let repoKeyBranch = try XCTUnwrap(provider.range(of: "if let repoKey = args[\"repo_key\"]"))
+            let defaultResolution = try XCTUnwrap(provider.range(of: "guard let defaultRepo = allRepos.first"))
+            XCTAssertLessThan(repoKeyBranch.lowerBound, defaultResolution.lowerBound)
+            XCTAssertFalse(provider.contains("awaitAppliedIngress(rootScope: .visibleWorkspacePlusGitData)"))
+            XCTAssertEqual(
+                provider.components(separatedBy: "awaitAppliedIngressForExplicitRequest(").count - 1,
+                2
+            )
+
+            let publisher = try source("Sources/RepoPrompt/Infrastructure/VCS/GitDiff/GitDiffSnapshotPublisher.swift")
+            XCTAssertEqual(publisher.components(separatedBy: "engine.buildSnapshotInputs(").count - 1, 1)
+            XCTAssertTrue(publisher.contains("generateDiffText: mode != .quick"))
+
+            let selection = try source("Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel+SelectionEngine.swift")
+            XCTAssertTrue(selection.contains("rootScope: WorkspaceLookupRootScope = .visibleWorkspacePlusGitData"))
         }
 
         func testFileSystemChangePublisherSendsRemainCentralized() throws {

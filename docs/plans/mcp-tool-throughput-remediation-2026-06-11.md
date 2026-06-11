@@ -59,10 +59,10 @@ Improve MCP throughput across same-connection bursts, parallel agent threads, lo
 - [x] Phase 0 / WI-1 — watcher startup and recovery correctness
 - [x] Phase 0 / WI-2 — correlated request timeline and permit lifecycle events
 - [x] Phase 0 / WI-3 — invalidation, rebuild, Git, and read work-count diagnostics plus baseline capture
-- [ ] Phase 1 / WI-4 — selective catalog eviction and duplicate-clear removal
-- [ ] Phase 1 / WI-5 — Git request-scoped context, single artifact build, artifact scope and ingress fixes
-- [ ] Phase 1 / WI-6 — long-thread transcript critical path
-- [ ] Phase 1 / WI-7 — `read_file` content reuse and freshness narrowing
+- [x] Phase 1 / WI-4 — selective catalog eviction and duplicate-clear removal
+- [x] Phase 1 / WI-5 — Git request-scoped context, single artifact build, artifact scope and ingress fixes
+- [x] Phase 1 / WI-6 — long-thread transcript critical path
+- [x] Phase 1 / WI-7 — `read_file` content reuse and freshness narrowing
 - [ ] Phase 2 / WI-8 — off-MainActor provider projection
 - [ ] Phase 2 / WI-9 — bounded Git concurrency and command consolidation
 - [ ] Phase 2 / WI-10 — classified, resource-keyed ordinary-tool admission

@@ -174,6 +174,11 @@ actor WorkspaceFileContextStore {
         }
     }
 
+    private struct ScopedIngressBarrierCompletedCut {
+        let target: ScopedIngressBarrierTarget
+        let sample: WorkspaceIngressBarrierSample
+    }
+
     #if DEBUG
         private struct ScopedIngressBarrierTaskOutput {
             let sample: WorkspaceIngressBarrierSample
@@ -298,6 +303,7 @@ actor WorkspaceFileContextStore {
             let joinCount: Int
             let successorCount: Int
             let coalescedSuccessorCount: Int
+            let noopCount: Int
         }
 
         struct ScopedIngressBarrierDebugSnapshot: Equatable {
@@ -512,7 +518,8 @@ actor WorkspaceFileContextStore {
                 launchCount: scopedIngressBarrierLaunchCountsByRootID[rootID] ?? 0,
                 joinCount: scopedIngressBarrierJoinCountsByRootID[rootID] ?? 0,
                 successorCount: scopedIngressBarrierSuccessorCountsByRootID[rootID] ?? 0,
-                coalescedSuccessorCount: scopedIngressBarrierCoalescedSuccessorCountsByRootID[rootID] ?? 0
+                coalescedSuccessorCount: scopedIngressBarrierCoalescedSuccessorCountsByRootID[rootID] ?? 0,
+                noopCount: scopedIngressBarrierNoopCountsByRootID[rootID] ?? 0
             )
         }
 
@@ -707,9 +714,6 @@ actor WorkspaceFileContextStore {
                 scopedIngressBarrierMaxWaitMillisecondsByRootID[rootID] ?? 0,
                 durationMilliseconds
             )
-            if sample.pendingRawEventCountBeforeFlush == 0 {
-                scopedIngressBarrierNoopCountsByRootID[rootID, default: 0] += 1
-            }
             guard token > (lastCompletedScopedIngressBarrierByRootID[rootID]?.token ?? 0) else { return }
             lastCompletedScopedIngressBarrierByRootID[rootID] = ScopedIngressBarrierDebugSnapshot.Completed(
                 token: token,
@@ -773,6 +777,10 @@ actor WorkspaceFileContextStore {
             await searchDecodedContentCache.snapshotForTesting()
         }
 
+        func interactiveReadCacheSnapshotForTesting() async -> WorkspaceInteractiveReadCache.Snapshot {
+            await interactiveReadCache.snapshotForTesting()
+        }
+
         func searchLaneSnapshotForTesting() async -> StoreBackedWorkspaceSearchLane.Snapshot {
             await storeBackedSearchLane.snapshotForTesting()
         }
@@ -814,9 +822,31 @@ actor WorkspaceFileContextStore {
         var fileIDsByStandardizedFullPath: [String: UUID] = [:]
     }
 
+    private struct SearchCatalogRootDependency: Hashable {
+        let canonicalIdentity: String
+        let rootID: UUID
+        let lifetimeID: UUID
+        let generation: UInt64
+    }
+
+    private enum SearchCatalogSnapshotValidationToken: Hashable {
+        case staticScope(generation: UInt64)
+        case sessionBound(
+            logicalRootPaths: [String],
+            physicalRootPaths: [String],
+            dependencies: [SearchCatalogRootDependency]
+        )
+    }
+
     private struct SearchCatalogSnapshotCacheEntry {
-        let validationToken: UInt64
+        let validationToken: SearchCatalogSnapshotValidationToken
         let snapshot: WorkspaceSearchCatalogSnapshot
+        var lastAccessSequence: UInt64
+    }
+
+    private struct SessionCatalogGenerationState {
+        let validationToken: SearchCatalogSnapshotValidationToken
+        let generation: UInt64
     }
 
     private var rootStatesByID: [UUID: RootState] = [:]
@@ -837,10 +867,17 @@ actor WorkspaceFileContextStore {
         .visibleWorkspacePlusGitData: 0,
         .allLoaded: 0
     ]
+    private var catalogGenerationsByRootID: [UUID: UInt64] = [:]
+    private var sessionCatalogGenerationStatesByScope: [WorkspaceLookupRootScope: SessionCatalogGenerationState] = [:]
+    private var nextSessionCatalogGeneration: UInt64 = 0
     private var searchCatalogSnapshotsByScope: [WorkspaceLookupRootScope: SearchCatalogSnapshotCacheEntry] = [:]
+    private var nextSearchCatalogSnapshotAccessSequence: UInt64 = 0
+    private var pathMatchSnapshotIdentitiesByScope: [WorkspaceLookupRootScope: PathMatchCacheIdentity] = [:]
     private let storeBackedSearchLane: StoreBackedWorkspaceSearchLane
     private let searchDecodedContentCache = WorkspaceSearchDecodedContentCache()
+    private let interactiveReadCache = WorkspaceInteractiveReadCache()
     private let searchContentSchedulerOwnerID = UUID()
+    private let interactiveReadSchedulerOwnerID = UUID()
     #if os(macOS)
         private let searchContentMemoryPressureSource: DispatchSourceMemoryPressure
     #endif
@@ -865,6 +902,7 @@ actor WorkspaceFileContextStore {
     private let publisherIngressCoordinator: WorkspaceFileSystemIngressCoordinator
     private let unloadTerminationPolicy: WorkspaceRootUnloadTerminationPolicy
     private var scopedIngressBarrierFlightStatesByRootID: [UUID: ScopedIngressBarrierRootFlightState] = [:]
+    private var completedScopedIngressBarrierCutsByRootID: [UUID: ScopedIngressBarrierCompletedCut] = [:]
     private var nextScopedIngressBarrierToken: UInt64 = 0
     private static let maxConcurrentScopedIngressBarriers = 8
     private var codeScanResultTask: Task<Void, Never>?
@@ -1393,8 +1431,10 @@ actor WorkspaceFileContextStore {
     func searchCatalogSnapshot(rootScope: WorkspaceLookupRootScope = .visibleWorkspace) -> WorkspaceSearchCatalogSnapshot {
         let catalogSnapshotState = EditFlowPerf.begin(EditFlowPerf.Stage.Search.catalogSnapshot)
         let validationToken = searchCatalogSnapshotValidationToken(scope: rootScope)
-        if let cached = searchCatalogSnapshotsByScope[rootScope] {
+        if var cached = searchCatalogSnapshotsByScope[rootScope] {
             if cached.validationToken == validationToken {
+                cached.lastAccessSequence = nextSearchCatalogAccessSequence()
+                searchCatalogSnapshotsByScope[rootScope] = cached
                 EditFlowPerf.end(
                     EditFlowPerf.Stage.Search.catalogSnapshot,
                     catalogSnapshotState,
@@ -1570,19 +1610,27 @@ actor WorkspaceFileContextStore {
         userPath: String,
         fallbackScope: WorkspaceLookupRootScope
     ) async -> [WorkspaceIngressBarrierSample] {
+        await awaitAppliedIngressForExplicitRequest(
+            userPath: userPath,
+            fallbackRootRefs: rootRefs(scope: fallbackScope)
+        )
+    }
+
+    func awaitAppliedIngressForExplicitRequest(
+        userPath: String,
+        fallbackRootRefs: [WorkspaceRootRef]
+    ) async -> [WorkspaceIngressBarrierSample] {
         let trimmed = userPath.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return [] }
         let expanded = (trimmed as NSString).expandingTildeInPath
         let standardized = (expanded as NSString).standardizingPath
         guard standardized.hasPrefix("/") else {
-            return await awaitAppliedIngress(rootScope: fallbackScope)
+            return await awaitAppliedIngress(rootIDs: fallbackRootRefs.map(\.id))
         }
-        let containingRootID = rootLoadOrder.compactMap { rootID -> WorkspaceRootRecord? in
-            rootStatesByID[rootID]?.root
-        }
-        .filter { StandardizedPath.isDescendant(standardized, of: $0.standardizedFullPath) }
-        .max { $0.standardizedFullPath.count < $1.standardizedFullPath.count }?
-        .id
+        let containingRootID = fallbackRootRefs
+            .filter { StandardizedPath.isDescendant(standardized, of: $0.standardizedFullPath) }
+            .max { $0.standardizedFullPath.count < $1.standardizedFullPath.count }?
+            .id
         guard let containingRootID else { return [] }
         return await awaitAppliedIngress(rootIDs: [containingRootID])
     }
@@ -1639,7 +1687,26 @@ actor WorkspaceFileContextStore {
         rootID: UUID,
         target: ScopedIngressBarrierTarget
     ) async -> WorkspaceIngressBarrierSample? {
-        guard !Task.isCancelled, rootStatesByID[rootID] != nil else { return nil }
+        guard !Task.isCancelled, let state = rootStatesByID[rootID] else { return nil }
+        if completedScopedIngressBarrierCutsByRootID[rootID] != nil {
+            let applied = publisherIngressCoordinator.appliedSnapshot(rootID: rootID)
+            if applied.appliedWatcherWatermark >= target.watcherAcceptedWatermark,
+               applied.appliedServicePublicationSequence >= target.acceptedServicePublicationSequence
+            {
+                #if DEBUG
+                    scopedIngressBarrierNoopCountsByRootID[rootID, default: 0] += 1
+                #endif
+                return WorkspaceIngressBarrierSample(
+                    rootID: rootID,
+                    rootPath: state.root.standardizedFullPath,
+                    pendingRawEventCountBeforeFlush: 0,
+                    acceptedWatcherWatermark: target.watcherAcceptedWatermark.rawValue,
+                    publishedServicePublicationSequence: target.acceptedServicePublicationSequence,
+                    appliedServicePublicationSequence: applied.appliedServicePublicationSequence,
+                    appliedWatcherWatermark: applied.appliedWatcherWatermark.rawValue
+                )
+            }
+        }
         let flightState = scopedIngressBarrierFlightStatesByRootID[rootID]
             ?? ScopedIngressBarrierRootFlightState()
 
@@ -1909,6 +1976,12 @@ actor WorkspaceFileContextStore {
             return
         }
         flightState.active = nil
+        if let output {
+            completedScopedIngressBarrierCutsByRootID[rootID] = ScopedIngressBarrierCompletedCut(
+                target: target,
+                sample: scopedIngressBarrierSample(from: output)
+            )
+        }
         #if DEBUG
             if let output {
                 recordScopedIngressBarrierCompletion(
@@ -2216,55 +2289,65 @@ actor WorkspaceFileContextStore {
     }
 
     func ensureIndexedFiles(paths: [String]) async -> [String] {
-        var indexed: [String] = []
-        var upsertedFilesByRoot: [UUID: [WorkspaceFileRecord]] = [:]
+        struct EligibleFile {
+            let fullPath: String
+            let rootID: UUID
+            let rootPath: String
+            let relativePath: String
+        }
+
+        var eligibleFiles: [EligibleFile] = []
         for rawPath in paths {
             let fullPath = StandardizedPath.absolute(rawPath)
             guard fileIDsByStandardizedFullPath[fullPath] == nil,
                   let root = loadedRoot(containing: fullPath),
                   let service = rootStatesByID[root.id]?.service
             else { continue }
-            let originalRootID = root.id
-            let originalRootPath = root.standardizedFullPath
             var isDirectory: ObjCBool = false
             guard FileManager.default.fileExists(atPath: fullPath, isDirectory: &isDirectory), !isDirectory.boolValue else { continue }
-            let relativePath = relativePath(for: fullPath, rootPath: originalRootPath)
+            let relativePath = relativePath(for: fullPath, rootPath: root.standardizedFullPath)
             guard !relativePath.isEmpty,
                   await service.catalogEligibleRegularFileExists(relativePath: relativePath)
             else { continue }
             #if DEBUG
                 if let ensureIndexedFilesEligibilityDidResolveHandler {
-                    await ensureIndexedFilesEligibilityDidResolveHandler(originalRootID, fullPath)
+                    await ensureIndexedFilesEligibilityDidResolveHandler(root.id, fullPath)
                 }
             #endif
-            guard fileIDsByStandardizedFullPath[fullPath] == nil,
-                  folderIDsByStandardizedFullPath[fullPath] == nil,
-                  var state = rootStatesByID[originalRootID],
-                  state.root.id == originalRootID,
-                  state.root.standardizedFullPath == originalRootPath,
-                  rootIDsByStandardizedPath[originalRootPath] == originalRootID,
-                  loadedRoot(containing: fullPath)?.id == originalRootID,
-                  state.fileIDsByRelativePath[relativePath] == nil,
-                  state.folderIDsByRelativePath[relativePath] == nil
+            eligibleFiles.append(EligibleFile(
+                fullPath: fullPath,
+                rootID: root.id,
+                rootPath: root.standardizedFullPath,
+                relativePath: relativePath
+            ))
+        }
+
+        var indexed: [String] = []
+        var upsertedFilesByRoot: [UUID: [WorkspaceFileRecord]] = [:]
+        for eligible in eligibleFiles {
+            guard fileIDsByStandardizedFullPath[eligible.fullPath] == nil,
+                  folderIDsByStandardizedFullPath[eligible.fullPath] == nil,
+                  var state = rootStatesByID[eligible.rootID],
+                  state.root.id == eligible.rootID,
+                  state.root.standardizedFullPath == eligible.rootPath,
+                  rootIDsByStandardizedPath[eligible.rootPath] == eligible.rootID,
+                  loadedRoot(containing: eligible.fullPath)?.id == eligible.rootID,
+                  state.fileIDsByRelativePath[eligible.relativePath] == nil,
+                  state.folderIDsByRelativePath[eligible.relativePath] == nil
             else { continue }
             var indexes = RootIndexBuffers()
-            let hierarchy = relativePath.split(separator: "/").count
+            let hierarchy = eligible.relativePath.split(separator: "/").count
             indexFiles(
-                [FSItemDTO(relativePath: relativePath, isDirectory: false, hierarchy: hierarchy)],
+                [FSItemDTO(relativePath: eligible.relativePath, isDirectory: false, hierarchy: hierarchy)],
                 root: state.root,
                 state: &state,
                 indexes: &indexes
             )
             guard !indexes.filesByID.isEmpty else { continue }
             commit(indexes)
-            rootStatesByID[originalRootID] = state
-            clearSearchCatalogSnapshotCache(
-                reasons: [.explicitMaterialization],
-                affectedRootIDs: [originalRootID],
-                affectedRootKinds: [state.root.kind]
-            )
-            indexed.append(fullPath)
-            upsertedFilesByRoot[originalRootID, default: []].append(contentsOf: indexes.filesByID.values)
+            rootStatesByID[eligible.rootID] = state
+            indexed.append(eligible.fullPath)
+            upsertedFilesByRoot[eligible.rootID, default: []].append(contentsOf: indexes.filesByID.values)
         }
         if !indexed.isEmpty {
             let affectedKinds = Set(upsertedFilesByRoot.keys.compactMap { rootStatesByID[$0]?.root.kind })
@@ -2804,6 +2887,7 @@ actor WorkspaceFileContextStore {
         rootStatesByID[root.id] = state
         rootLoadOrder.append(root.id)
         appliedIndexGenerationsByRootID[root.id] = 0
+        catalogGenerationsByRootID[root.id] = 0
         #if DEBUG
             rootCrawlCountsByRootID[root.id, default: 0] += 1
         #endif
@@ -2876,22 +2960,24 @@ actor WorkspaceFileContextStore {
                 flightState.active?.join.complete(with: nil)
                 flightState.pending?.join.complete(with: nil)
             }
+            completedScopedIngressBarrierCutsByRootID.removeValue(forKey: rootID)
             watcherCancellablesByRootID.removeValue(forKey: rootID)?.cancel()
             publisherIngressCoordinator.closePublisherIngress(rootID: rootID)
             guard let state = rootStatesByID.removeValue(forKey: rootID) else { continue }
             statesToUnload.append((rootID, state))
         }
         guard !statesToUnload.isEmpty else { return }
-        clearSearchCatalogSnapshotCache(
-            reasons: [.rootUnload],
-            affectedRootIDs: Set(statesToUnload.map(\.rootID)),
-            affectedRootKinds: Set(statesToUnload.map(\.state.root.kind))
+        invalidatePathMatchSnapshot(
+            affectedRootKinds: Set(statesToUnload.map(\.state.root.kind)),
+            reason: .rootUnload,
+            affectedRootIDs: Set(statesToUnload.map(\.rootID))
         )
         for entry in statesToUnload {
             for fileID in entry.state.fileIDsByRelativePath.values {
                 searchContentInvalidationEpochsByFileID.removeValue(forKey: fileID)
             }
             await searchDecodedContentCache.invalidate(rootID: entry.rootID)
+            await interactiveReadCache.invalidate(rootID: entry.rootID)
         }
         #if DEBUG
             let rootUnloadStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
@@ -3012,6 +3098,7 @@ actor WorkspaceFileContextStore {
                 isRootUnload: true
             ))
             appliedIndexGenerationsByRootID.removeValue(forKey: rootID)
+            catalogGenerationsByRootID.removeValue(forKey: rootID)
             #if DEBUG
                 publicationInvalidationHistoryByRootID.removeValue(forKey: rootID)
                 scopedIngressBarrierLaunchCountsByRootID.removeValue(forKey: rootID)
@@ -3027,12 +3114,6 @@ actor WorkspaceFileContextStore {
             #endif
         }
 
-        let unloadedRootKinds = Set(statesToUnload.map(\.state.root.kind))
-        invalidatePathMatchSnapshot(
-            affectedRootKinds: unloadedRootKinds,
-            reason: .rootUnload,
-            affectedRootIDs: removedRootIDSet
-        )
         #if DEBUG
             WorkspaceRestorePerfLog.event(
                 "store.rootUnload.indexCleanup",
@@ -3055,7 +3136,6 @@ actor WorkspaceFileContextStore {
                 ]
             )
         #endif
-        invalidatePathMatchCache()
         finishRootUnload(for: unloadingPaths)
         #if DEBUG
             WorkspaceRestorePerfLog.event(
@@ -3224,8 +3304,96 @@ actor WorkspaceFileContextStore {
         return staleSearchContentSnapshot(for: expectedRecord)
     }
 
+    func interactiveReadSnapshot(
+        for expectedRecord: WorkspaceFileRecord
+    ) async throws -> WorkspaceInteractiveReadSnapshot? {
+        for attempt in 0 ..< 2 {
+            try Task.checkCancellation()
+            guard let state = rootStatesByID[expectedRecord.rootID],
+                  let current = file(
+                      rootID: expectedRecord.rootID,
+                      relativePath: expectedRecord.standardizedRelativePath
+                  ),
+                  current.id == expectedRecord.id
+            else {
+                return nil
+            }
+
+            let service = state.service
+            let epoch = searchContentInvalidationEpochsByFileID[current.id] ?? 0
+            let cacheKey = WorkspaceInteractiveReadCacheKey(
+                rootID: current.rootID,
+                rootLifetimeID: state.lifetimeID,
+                fileID: current.id,
+                standardizedRelativePath: current.standardizedRelativePath
+            )
+            let fingerprint: FileContentFingerprint
+            do {
+                fingerprint = try await service.contentFingerprint(
+                    ofRelativePath: current.standardizedRelativePath
+                )
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch FileSystemError.fileNotFound {
+                pruneCatalogFileIfStillCurrent(current)
+                return nil
+            } catch {
+                return nil
+            }
+
+            guard searchContentRecordIsCurrent(current, invalidationEpoch: epoch) else {
+                if attempt == 0 { continue }
+                return nil
+            }
+
+            let schedulerOwnerID = interactiveReadSchedulerOwnerID
+            do {
+                let cached = try await interactiveReadCache.snapshot(
+                    for: cacheKey,
+                    fingerprint: fingerprint,
+                    invalidationEpoch: epoch
+                ) {
+                    let loaded = try await service.loadValidatedContent(
+                        ofRelativePath: current.standardizedRelativePath,
+                        expectedFingerprint: fingerprint,
+                        workloadClass: .interactiveRead,
+                        schedulerOwnerID: schedulerOwnerID
+                    )
+                    guard let content = loaded.content else { return nil }
+                    return await WorkspaceInteractiveReadProcessor.prepareOffActor(content)
+                }
+                guard let preparedContent = cached.preparedContent else {
+                    if attempt == 0 { continue }
+                    return nil
+                }
+                guard searchContentRecordIsCurrent(current, invalidationEpoch: epoch) else {
+                    if attempt == 0 { continue }
+                    return nil
+                }
+                return WorkspaceInteractiveReadSnapshot(
+                    preparedContent: preparedContent,
+                    cacheHit: cached.cacheHit
+                )
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch let error as ContentReadSchedulerError {
+                throw error
+            } catch FileContentValidationError.fingerprintChanged {
+                if attempt == 0 { continue }
+                return nil
+            } catch FileSystemError.fileNotFound {
+                pruneCatalogFileIfStillCurrent(current)
+                return nil
+            } catch {
+                return nil
+            }
+        }
+        return nil
+    }
+
     func clearSearchDecodedContentCache() async {
         await searchDecodedContentCache.clear()
+        await interactiveReadCache.clear()
     }
 
     func readContent(
@@ -3772,6 +3940,16 @@ actor WorkspaceFileContextStore {
         _ userPath: String,
         rootScope: WorkspaceLookupRootScope = .visibleWorkspace
     ) -> WorkspaceExplicitCatalogFileLookupResult {
+        lookupCatalogFileForExplicitRequest(
+            userPath,
+            rootRefs: rootRefs(scope: rootScope)
+        )
+    }
+
+    func lookupCatalogFileForExplicitRequest(
+        _ userPath: String,
+        rootRefs roots: [WorkspaceRootRef]
+    ) -> WorkspaceExplicitCatalogFileLookupResult {
         #if DEBUG || EDIT_FLOW_PERF
             var exactCatalogLookupOutcome = "noCandidate"
             var exactCatalogLookupRoute = "empty"
@@ -3802,7 +3980,6 @@ actor WorkspaceFileContextStore {
 
         let expanded = (trimmed as NSString).expandingTildeInPath
         let standardized = StandardizedPath.absolute(expanded)
-        let roots = rootRefs(scope: rootScope)
 
         if standardized.hasPrefix("/") {
             #if DEBUG || EDIT_FLOW_PERF
@@ -3879,13 +4056,23 @@ actor WorkspaceFileContextStore {
         _ userPath: String,
         rootScope: WorkspaceLookupRootScope = .visibleWorkspace
     ) async throws -> WorkspaceExplicitFileMaterializationResult {
+        try await materializeExplicitlyRequestedFile(
+            userPath,
+            rootRefs: rootRefs(scope: rootScope)
+        )
+    }
+
+    func materializeExplicitlyRequestedFile(
+        _ userPath: String,
+        rootRefs roots: [WorkspaceRootRef]
+    ) async throws -> WorkspaceExplicitFileMaterializationResult {
         let trimmed = userPath.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return .noCandidate }
         guard !StandardizedPath.containsNUL(trimmed) else { return .blocked }
         guard (trimmed as NSString).expandingTildeInPath.hasPrefix("/") else { return .noCandidate }
 
         let candidates: [(rootID: UUID, relativePath: String)]
-        switch explicitDiskLookupCandidates(for: trimmed, rootScope: rootScope) {
+        switch explicitDiskLookupCandidates(for: trimmed, rootRefs: roots) {
         case let .candidates(resolvedCandidates):
             candidates = resolvedCandidates
         case .ambiguousAlias:
@@ -3959,11 +4146,10 @@ actor WorkspaceFileContextStore {
 
     private func explicitDiskLookupCandidates(
         for userPath: String,
-        rootScope: WorkspaceLookupRootScope
+        rootRefs roots: [WorkspaceRootRef]
     ) -> ExplicitDiskLookupCandidatesResult {
         let expanded = (userPath as NSString).expandingTildeInPath
         let standardized = StandardizedPath.absolute(expanded)
-        let roots = rootRefs(scope: rootScope)
         var candidates: [(rootID: UUID, relativePath: String)] = []
         var seen = Set<String>()
 
@@ -4361,11 +4547,18 @@ actor WorkspaceFileContextStore {
     }
 
     func lookupPath(_ request: WorkspacePathLookupRequest) async -> WorkspacePathLookupResult? {
+        await lookupPath(request, rootRefs: rootRefs(scope: request.rootScope))
+    }
+
+    func lookupPath(
+        _ request: WorkspacePathLookupRequest,
+        rootRefs: [WorkspaceRootRef]
+    ) async -> WorkspacePathLookupResult? {
         let normalizedPath = normalizeUserInputPath(request.userPath)
         guard !normalizedPath.isEmpty else { return nil }
 
         let selectedFileFullPaths = request.selectedFileFullPaths
-        let staticData = buildStaticSnapshot(scope: request.rootScope)
+        let staticData = buildStaticSnapshot(scope: request.rootScope, rootRefs: rootRefs)
         guard let match = await pathMatchWorker.locate(
             userPath: normalizedPath,
             profile: request.profile,
@@ -4499,6 +4692,18 @@ actor WorkspaceFileContextStore {
         kind: WorkspaceExactPathLookupKind,
         rootScope: WorkspaceLookupRootScope = .visibleWorkspace
     ) -> PathResolutionIssue? {
+        exactPathResolutionIssue(
+            for: userPath,
+            kind: kind,
+            rootRefs: rootRefs(scope: rootScope)
+        )
+    }
+
+    func exactPathResolutionIssue(
+        for userPath: String,
+        kind: WorkspaceExactPathLookupKind,
+        rootRefs roots: [WorkspaceRootRef]
+    ) -> PathResolutionIssue? {
         let trimmedInput = userPath.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedInput.isEmpty else { return .emptyInput }
         if StandardizedPath.containsNUL(trimmedInput) {
@@ -4511,7 +4716,6 @@ actor WorkspaceFileContextStore {
         let standardized = StandardizedPath.absolute(expanded)
         guard !standardized.hasPrefix("/") else { return nil }
 
-        let roots = rootRefs(scope: rootScope)
         guard !roots.isEmpty else { return nil }
 
         switch WorkspaceAliasResolver.resolve(
@@ -4592,19 +4796,36 @@ actor WorkspaceFileContextStore {
         rootScope: WorkspaceLookupRootScope = .visibleWorkspace,
         profile: PathLocateProfile = .mcpSelection
     ) async -> (folder: WorkspaceFolderRecord?, displayPath: String?, issue: PathResolutionIssue?) {
+        await resolveFolderInput(
+            path,
+            rootScope: rootScope,
+            profile: profile,
+            rootRefs: rootRefs(scope: rootScope)
+        )
+    }
+
+    func resolveFolderInput(
+        _ path: String,
+        rootScope: WorkspaceLookupRootScope,
+        profile: PathLocateProfile,
+        rootRefs roots: [WorkspaceRootRef],
+        validateIssue: Bool = true,
+        allowGeneralLookupFallback: Bool = true
+    ) async -> (folder: WorkspaceFolderRecord?, displayPath: String?, issue: PathResolutionIssue?) {
         let cleaned = normalizeUserInputPath(path).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleaned.isEmpty else { return (nil, nil, .emptyInput) }
 
-        if let issue = exactPathResolutionIssue(for: cleaned, kind: .folder, rootScope: rootScope) {
+        if validateIssue,
+           let issue = exactPathResolutionIssue(for: cleaned, kind: .folder, rootRefs: roots)
+        {
             return (nil, nil, issue)
         }
 
-        let roots = rootRefs(scope: rootScope)
         if cleaned.hasPrefix("/") {
             if let folderID = folderIDsByStandardizedFullPath[StandardizedPath.absolute(cleaned)],
                isDiscoverableFolderID(folderID),
                let folder = foldersByID[folderID],
-               let root = rootRefs(scope: rootScope).first(where: { $0.id == folder.rootID })
+               let root = roots.first(where: { $0.id == folder.rootID })
             {
                 return (folder, ClientPathFormatter.displayPath(root: root, relativePath: folder.standardizedRelativePath, visibleRoots: roots), nil)
             }
@@ -4653,8 +4874,12 @@ actor WorkspaceFileContextStore {
             )
         }
 
+        guard allowGeneralLookupFallback else { return (nil, nil, nil) }
         let generalLookupState = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.folderResolutionGeneralLookupFallback)
-        let lookup = await lookupPath(WorkspacePathLookupRequest(userPath: cleaned, profile: profile, rootScope: rootScope))
+        let lookup = await lookupPath(
+            WorkspacePathLookupRequest(userPath: cleaned, profile: profile, rootScope: rootScope),
+            rootRefs: roots
+        )
         EditFlowPerf.end(
             EditFlowPerf.Stage.ReadFile.folderResolutionGeneralLookupFallback,
             generalLookupState,
@@ -4737,9 +4962,15 @@ actor WorkspaceFileContextStore {
     }
 
     private func buildStaticSnapshot(scope: WorkspaceLookupRootScope) -> StaticPathMatchData {
+        buildStaticSnapshot(scope: scope, rootRefs: rootRefs(scope: scope))
+    }
+
+    private func buildStaticSnapshot(
+        scope: WorkspaceLookupRootScope,
+        rootRefs roots: [WorkspaceRootRef]
+    ) -> StaticPathMatchData {
         let snapshotState = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.pathLookupStaticSnapshotBuild)
         defer { EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.pathLookupStaticSnapshotBuild, snapshotState) }
-        let roots = rootsForPathLookup(scope: scope)
         let allowedRootIDs = Set(roots.map(\.id))
         var fileRecords: [String: FileRecord] = [:]
         for file in filesByID.values.sorted(by: { $0.standardizedFullPath < $1.standardizedFullPath }) {
@@ -4782,45 +5013,105 @@ actor WorkspaceFileContextStore {
                 displayName: folder.name
             ) as FolderRecord
         }
+        let cacheIdentity = pathMatchCacheIdentity(scope: scope)
+        pathMatchSnapshotIdentitiesByScope[scope] = cacheIdentity
         return StaticPathMatchData(
             filesByFullPath: fileRecords,
             foldersByFullPath: folderRecords,
             rootFolders: rootFolders,
-            id: scopedSnapshotGeneration(scope: scope)
+            cacheScopeID: cacheIdentity.scopeID,
+            id: cacheIdentity.snapshotID
+        )
+    }
+
+    private func pathMatchCacheIdentity(scope: WorkspaceLookupRootScope) -> PathMatchCacheIdentity {
+        PathMatchCacheIdentity(
+            scopeID: scopeDiscriminator(scope),
+            snapshotID: scopedSnapshotGeneration(scope: scope)
         )
     }
 
     private func scopedSnapshotGeneration(scope: WorkspaceLookupRootScope) -> UInt64 {
-        (catalogGenerationsByScope[scope] ?? 0) &* 3 &+ scopeDiscriminator(scope)
+        let validationToken = searchCatalogSnapshotValidationToken(scope: scope)
+        switch validationToken {
+        case let .staticScope(generation):
+            return generation
+        case .sessionBound:
+            if let state = sessionCatalogGenerationStatesByScope[scope],
+               state.validationToken == validationToken
+            {
+                return state.generation
+            }
+            nextSessionCatalogGeneration &+= 1
+            let generation = nextSessionCatalogGeneration
+            sessionCatalogGenerationStatesByScope[scope] = SessionCatalogGenerationState(
+                validationToken: validationToken,
+                generation: generation
+            )
+            return generation
+        }
     }
 
-    private func searchCatalogSnapshotValidationToken(scope: WorkspaceLookupRootScope) -> UInt64 {
+    private func searchCatalogSnapshotValidationToken(
+        scope: WorkspaceLookupRootScope
+    ) -> SearchCatalogSnapshotValidationToken {
         switch scope {
-        case .sessionBoundWorkspace:
-            scopedSnapshotGeneration(scope: .allLoaded)
-        default:
-            scopedSnapshotGeneration(scope: scope)
+        case .visibleWorkspace, .visibleWorkspacePlusGitData, .allLoaded:
+            let generation = (catalogGenerationsByScope[scope] ?? 0) &* 3 &+ scopeDiscriminator(scope)
+            return .staticScope(generation: generation)
+        case let .sessionBoundWorkspace(logicalRootPaths, physicalRootPaths):
+            let normalizedLogicalRootPaths = normalizedSessionSelectorPaths(logicalRootPaths).sorted()
+            let normalizedPhysicalRootPaths = normalizedSessionSelectorPaths(physicalRootPaths).sorted()
+            let dependencies = rootsForPathLookup(scope: scope).compactMap { root -> SearchCatalogRootDependency? in
+                guard let state = rootStatesByID[root.id] else { return nil }
+                return SearchCatalogRootDependency(
+                    canonicalIdentity: root.standardizedFullPath,
+                    rootID: root.id,
+                    lifetimeID: state.lifetimeID,
+                    generation: catalogGenerationsByRootID[root.id] ?? 0
+                )
+            }.sorted {
+                if $0.canonicalIdentity == $1.canonicalIdentity {
+                    return $0.rootID.uuidString < $1.rootID.uuidString
+                }
+                return $0.canonicalIdentity < $1.canonicalIdentity
+            }
+            return .sessionBound(
+                logicalRootPaths: normalizedLogicalRootPaths,
+                physicalRootPaths: normalizedPhysicalRootPaths,
+                dependencies: dependencies
+            )
         }
     }
 
     private func cacheSearchCatalogSnapshot(
         _ snapshot: WorkspaceSearchCatalogSnapshot,
-        validationToken: UInt64,
+        validationToken: SearchCatalogSnapshotValidationToken,
         scope: WorkspaceLookupRootScope
     ) {
         if searchCatalogSnapshotsByScope[scope] == nil,
-           searchCatalogSnapshotsByScope.count >= Self.maxCachedSearchCatalogSnapshotScopes
+           searchCatalogSnapshotsByScope.count >= Self.maxCachedSearchCatalogSnapshotScopes,
+           let eviction = searchCatalogSnapshotsByScope.min(by: {
+               $0.value.lastAccessSequence < $1.value.lastAccessSequence
+           })
         {
-            clearSearchCatalogSnapshotCache(
+            evictSearchCatalogSnapshots(
+                scopes: [eviction.key],
                 reasons: [.cacheCapacity],
-                affectedRootIDs: Set(snapshot.roots.map(\.id)),
-                affectedRootKinds: Set(snapshot.roots.map(\.kind))
+                affectedRootIDs: Set(eviction.value.snapshot.roots.map(\.id)),
+                affectedRootKinds: Set(eviction.value.snapshot.roots.map(\.kind))
             )
         }
         searchCatalogSnapshotsByScope[scope] = SearchCatalogSnapshotCacheEntry(
             validationToken: validationToken,
-            snapshot: snapshot
+            snapshot: snapshot,
+            lastAccessSequence: nextSearchCatalogAccessSequence()
         )
+    }
+
+    private func nextSearchCatalogAccessSequence() -> UInt64 {
+        nextSearchCatalogSnapshotAccessSequence &+= 1
+        return nextSearchCatalogSnapshotAccessSequence
     }
 
     private func scopeDiscriminator(_ scope: WorkspaceLookupRootScope) -> UInt64 {
@@ -4834,20 +5125,29 @@ actor WorkspaceFileContextStore {
         case let .sessionBoundWorkspace(logicalRootPaths, physicalRootPaths):
             var hasher = Hasher()
             hasher.combine("sessionBoundWorkspace")
-            hasher.combine(logicalRootPaths.sorted())
-            hasher.combine(physicalRootPaths.sorted())
+            hasher.combine(normalizedSessionSelectorPaths(logicalRootPaths).sorted())
+            hasher.combine(normalizedSessionSelectorPaths(physicalRootPaths).sorted())
             return UInt64(bitPattern: Int64(hasher.finalize()))
         }
     }
 
-    private func bumpCatalogGenerations(affectedRootKinds: Set<WorkspaceRootKind>) {
-        guard !affectedRootKinds.isEmpty else { return }
+    private func bumpCatalogGenerations(
+        affectedRootKinds: Set<WorkspaceRootKind>,
+        affectedRootIDs: Set<UUID>
+    ) {
+        guard !affectedRootKinds.isEmpty || !affectedRootIDs.isEmpty else { return }
         for scope in WorkspaceFileContextStore.catalogGenerationScopes {
             guard scopeIncludesAnyRootKind(scope, affectedRootKinds) else { continue }
             catalogGenerationsByScope[scope] = (catalogGenerationsByScope[scope] ?? 0) &+ 1
             #if DEBUG
                 Self.activePublicationInvalidationRecorder?.catalogGenerationAdvanceCount += 1
             #endif
+        }
+        let rootIDsToAdvance = affectedRootIDs.isEmpty
+            ? Set(rootStatesByID.values.compactMap { affectedRootKinds.contains($0.root.kind) ? $0.root.id : nil })
+            : affectedRootIDs
+        for rootID in rootIDsToAdvance {
+            catalogGenerationsByRootID[rootID] = (catalogGenerationsByRootID[rootID] ?? 0) &+ 1
         }
     }
 
@@ -4870,6 +5170,10 @@ actor WorkspaceFileContextStore {
         }
     }
 
+    private func normalizedSessionSelectorPaths(_ paths: Set<String>) -> Set<String> {
+        Set(paths.map { StandardizedPath.absolute(($0 as NSString).expandingTildeInPath) })
+    }
+
     private func rootsForPathLookup(scope: WorkspaceLookupRootScope) -> [WorkspaceRootRecord] {
         let allRoots = roots()
         switch scope {
@@ -4880,12 +5184,14 @@ actor WorkspaceFileContextStore {
         case .allLoaded:
             return allRoots
         case let .sessionBoundWorkspace(logicalRootPaths, physicalRootPaths):
+            let normalizedLogicalRootPaths = normalizedSessionSelectorPaths(logicalRootPaths)
+            let normalizedPhysicalRootPaths = normalizedSessionSelectorPaths(physicalRootPaths)
             return allRoots.filter { root in
                 switch root.kind {
                 case .primaryWorkspace:
-                    !logicalRootPaths.contains(root.standardizedFullPath)
+                    !normalizedLogicalRootPaths.contains(root.standardizedFullPath)
                 case .sessionWorktree:
-                    physicalRootPaths.contains(root.standardizedFullPath)
+                    normalizedPhysicalRootPaths.contains(root.standardizedFullPath)
                 case .workspaceGitData, .supplementalSystem:
                     false
                 }
@@ -4901,12 +5207,30 @@ actor WorkspaceFileContextStore {
     }
 
     @discardableResult
-    private func clearSearchCatalogSnapshotCache(
+    private func evictInvalidSearchCatalogSnapshots(
         reasons: Set<CatalogInvalidationReason>,
         affectedRootIDs: Set<UUID> = [],
         affectedRootKinds: Set<WorkspaceRootKind> = []
     ) -> [WorkspaceLookupRootScope] {
-        let evictedScopes = Array(searchCatalogSnapshotsByScope.keys)
+        let scopes = Set(searchCatalogSnapshotsByScope.compactMap { scope, entry in
+            entry.validationToken == searchCatalogSnapshotValidationToken(scope: scope) ? nil : scope
+        })
+        return evictSearchCatalogSnapshots(
+            scopes: scopes,
+            reasons: reasons,
+            affectedRootIDs: affectedRootIDs,
+            affectedRootKinds: affectedRootKinds
+        )
+    }
+
+    @discardableResult
+    private func evictSearchCatalogSnapshots(
+        scopes: Set<WorkspaceLookupRootScope>,
+        reasons: Set<CatalogInvalidationReason>,
+        affectedRootIDs: Set<UUID> = [],
+        affectedRootKinds: Set<WorkspaceRootKind> = []
+    ) -> [WorkspaceLookupRootScope] {
+        let evictedScopes = Array(scopes).filter { searchCatalogSnapshotsByScope.removeValue(forKey: $0) != nil }
         #if DEBUG
             Self.activePublicationInvalidationRecorder?.searchCatalogCacheClearCount += 1
             recordCatalogInvalidation(
@@ -4916,7 +5240,6 @@ actor WorkspaceFileContextStore {
                 evictedScopes: evictedScopes
             )
         #endif
-        searchCatalogSnapshotsByScope.removeAll(keepingCapacity: true)
         return evictedScopes
     }
 
@@ -4971,6 +5294,7 @@ actor WorkspaceFileContextStore {
         }
         Task {
             await searchDecodedContentCache.invalidate(key, through: invalidationEpoch)
+            await interactiveReadCache.invalidate(key, through: invalidationEpoch)
         }
     }
 
@@ -4989,6 +5313,7 @@ actor WorkspaceFileContextStore {
         let searchContentInvalidations = batch.searchContentInvalidations
         Task {
             await searchDecodedContentCache.invalidate(searchContentInvalidations)
+            await interactiveReadCache.invalidate(searchContentInvalidations)
         }
     }
 
@@ -5019,20 +5344,30 @@ actor WorkspaceFileContextStore {
         #if DEBUG
             Self.activePublicationInvalidationRecorder?.topologyInvalidationCount += 1
         #endif
-        bumpCatalogGenerations(affectedRootKinds: affectedRootKinds)
-        clearSearchCatalogSnapshotCache(
+        bumpCatalogGenerations(
+            affectedRootKinds: affectedRootKinds,
+            affectedRootIDs: affectedRootIDs
+        )
+        evictInvalidSearchCatalogSnapshots(
             reasons: reasons,
             affectedRootIDs: affectedRootIDs,
             affectedRootKinds: affectedRootKinds
         )
-        invalidatePathMatchCache()
+        let stalePathMatchIdentities = Set(pathMatchSnapshotIdentitiesByScope.compactMap { scope, identity in
+            identity == pathMatchCacheIdentity(scope: scope) ? nil : identity
+        })
+        pathMatchSnapshotIdentitiesByScope = pathMatchSnapshotIdentitiesByScope.filter { scope, identity in
+            identity == pathMatchCacheIdentity(scope: scope)
+        }
+        invalidatePathMatchCache(snapshotIdentities: stalePathMatchIdentities)
     }
 
-    private func invalidatePathMatchCache() {
+    private func invalidatePathMatchCache(snapshotIdentities: Set<PathMatchCacheIdentity>) {
+        guard !snapshotIdentities.isEmpty else { return }
         #if DEBUG
             Self.activePublicationInvalidationRecorder?.pathWorkerInvalidationRequestCount += 1
         #endif
-        Task { await pathMatchWorker.invalidateCache() }
+        Task { await pathMatchWorker.invalidateCache(snapshotIdentities: snapshotIdentities) }
     }
 
     private func indexFolder(relativePath: String, root: WorkspaceRootRecord) {

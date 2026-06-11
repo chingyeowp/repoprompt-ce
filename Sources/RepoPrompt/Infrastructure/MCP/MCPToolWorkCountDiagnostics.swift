@@ -131,6 +131,9 @@ enum MCPToolWorkCountDiagnostics {
                 self.returnedBytes = max(0, returnedBytes)
                 self.returnedLines = max(0, returnedLines)
                 self.cacheHit = cacheHit
+                if cacheHit, source == "unknown" {
+                    source = "interactive_cache"
+                }
                 lock.unlock()
             }
 

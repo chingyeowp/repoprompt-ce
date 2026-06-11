@@ -42,7 +42,7 @@ import XCTest
             XCTAssertEqual(snapshot.commandCount, 6, snapshot.commands.joined(separator: "\n"))
         }
 
-        func testArtifactModesPreserveCurrentSevenAndFourteenPlusUntrackedCounts() async throws {
+        func testArtifactModesShowWI5SingleBuildCommandCountDelta() async throws {
             let fixture = try GitWorkCountFixture()
             defer { fixture.cleanup() }
             let vcs = VCSService()
@@ -54,10 +54,10 @@ import XCTest
             )
             let repo = GitRepoDescriptor(rootURL: fixture.repo)
 
-            for (mode, expectedCommandCount) in [
-                (GitDiffPublishMode.quick, 7),
-                (.standard, 15),
-                (.deep, 15)
+            for (mode, wi3Baseline, wi5Expected) in [
+                (GitDiffPublishMode.quick, 7, 7),
+                (.standard, 15, 9),
+                (.deep, 15, 9)
             ] {
                 let snapshot = try await capture(operation: "artifact_\(mode.rawValue)") {
                     _ = try await publisher.publish(
@@ -77,9 +77,12 @@ import XCTest
                 }
                 XCTAssertEqual(
                     snapshot.commandCount,
-                    expectedCommandCount,
-                    "\(mode.rawValue):\n\(snapshot.commands.joined(separator: "\n"))"
+                    wi5Expected,
+                    "\(mode.rawValue) WI-3 baseline=\(wi3Baseline), WI-5 expected=\(wi5Expected):\n\(snapshot.commands.joined(separator: "\n"))"
                 )
+                if mode != .quick {
+                    XCTAssertLessThan(snapshot.commandCount, wi3Baseline)
+                }
             }
         }
 

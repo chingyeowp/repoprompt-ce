@@ -4,6 +4,149 @@ import MCP
 import Ontology
 
 @MainActor
+private final class MCPGitRequestContext {
+    typealias WorktreeDTO = ToolResultDTOs.GitToolReplyDTO.WorktreeDTO
+
+    let rootRefs: [WorkspaceRootRef]
+
+    private let vcsService: VCSService
+    private var discoveredRepos: [GitRepoDescriptor]?
+    private var backendsByPath: [String: any VCSBackend] = [:]
+    private var resolvedBranchPaths: Set<String> = []
+    private var branchesByPath: [String: String] = [:]
+    private var resolvedHeadPaths: Set<String> = []
+    private var headsByPath: [String: String] = [:]
+    private var resolvedWorktreePaths: Set<String> = []
+    private var worktreesByPath: [String: WorktreeDTO] = [:]
+    private var resolvedMainBranchPaths: Set<String> = []
+    private var mainBranchesByPath: [String: String] = [:]
+
+    init(rootRefs: [WorkspaceRootRef], vcsService: VCSService) {
+        self.rootRefs = rootRefs
+        self.vcsService = vcsService
+    }
+
+    func allRepos() async -> [GitRepoDescriptor] {
+        if let discoveredRepos { return discoveredRepos }
+
+        var seenRoots = Set<String>()
+        var seenRepos = Set<String>()
+        var repos: [GitRepoDescriptor] = []
+        for root in rootRefs {
+            let standardized = root.standardizedFullPath
+            let rootKey = standardized.lowercased()
+            guard seenRoots.insert(rootKey).inserted else { continue }
+            guard let resolved = await vcsService.resolveRepo(from: URL(fileURLWithPath: standardized)) else { continue }
+            let repo = GitRepoDescriptor(rootURL: resolved.rootURL)
+            guard seenRepos.insert(repo.rootPath.lowercased()).inserted else { continue }
+            repos.append(repo)
+        }
+        discoveredRepos = repos
+        return repos
+    }
+
+    func backend(for repoURL: URL) async -> any VCSBackend {
+        let key = pathKey(repoURL)
+        if let backend = backendsByPath[key] { return backend }
+        let backend = await vcsService.backend(forRepoRoot: repoURL)
+        backendsByPath[key] = backend
+        return backend
+    }
+
+    func currentBranch(for repoURL: URL) async -> String? {
+        let key = pathKey(repoURL)
+        if resolvedBranchPaths.contains(key) { return branchesByPath[key] }
+        let backend = await backend(for: repoURL)
+        let branch = try? await backend.getCurrentBranch(at: repoURL)
+        resolvedBranchPaths.insert(key)
+        branchesByPath[key] = branch
+        return branch
+    }
+
+    func headID(for repoURL: URL) async -> String? {
+        let key = pathKey(repoURL)
+        if resolvedHeadPaths.contains(key) { return headsByPath[key] }
+        let backend = await backend(for: repoURL)
+        let head = try? await backend.getHeadID(at: repoURL)
+        resolvedHeadPaths.insert(key)
+        headsByPath[key] = head
+        return head
+    }
+
+    func normalizeCompareSpec(_ spec: GitDiffCompareSpec, at repoURL: URL) async -> NormalizedCompareResult {
+        let backend = await backend(for: repoURL)
+        if let withWarnings = backend as? VCSBackendWithWarnings {
+            return withWarnings.normalizeCompareSpecWithWarning(spec)
+        }
+        return NormalizedCompareResult(spec: backend.normalizeCompareSpec(spec), warning: nil)
+    }
+
+    func mainBranchRef(for repoURL: URL) async -> String? {
+        let key = pathKey(repoURL)
+        if resolvedMainBranchPaths.contains(key) { return mainBranchesByPath[key] }
+
+        let backend = await backend(for: repoURL)
+        let remoteBranches = await (try? backend.getRemoteBranches(at: repoURL, limit: 200).map(\.name)) ?? []
+        let localBranches = await (try? backend.getLocalBranches(at: repoURL, limit: 200).map(\.name)) ?? []
+
+        func pick(_ candidates: [String], in list: [String]) -> String? {
+            candidates.first(where: list.contains)
+        }
+
+        var branch = pick(["origin/main", "upstream/main"], in: remoteBranches)
+            ?? pick(["main"], in: localBranches)
+            ?? pick(["origin/master", "upstream/master"], in: remoteBranches)
+            ?? pick(["master"], in: localBranches)
+        if branch == nil, let upstream = try? await backend.getUpstreamRef(at: repoURL), !upstream.isEmpty {
+            branch = upstream
+        }
+        resolvedMainBranchPaths.insert(key)
+        mainBranchesByPath[key] = branch
+        return branch
+    }
+
+    func worktreeDTO(for repoURL: URL) async -> WorktreeDTO? {
+        let key = pathKey(repoURL)
+        if resolvedWorktreePaths.contains(key) { return worktreesByPath[key] }
+        resolvedWorktreePaths.insert(key)
+
+        let backend = await backend(for: repoURL)
+        guard backend.kind == .git else { return nil }
+        guard let layout = await vcsService.gitRepositoryLayout(forRepoRoot: repoURL), layout.isLinkedWorktree else { return nil }
+
+        let listedMainRoot = try? await vcsService.listGitWorktrees(at: repoURL)
+            .first(where: \.isMain)
+            .map { URL(fileURLWithPath: $0.path).standardizedFileURL }
+        let mainRoot = listedMainRoot ?? GitRepoTargetResolver.resolveMainWorktreeRoot(for: layout)
+        let worktreeBranch = await currentBranch(for: repoURL)
+        let worktreeHead = await (headID(for: repoURL)).map { String($0.prefix(7)) }
+        var mainBranch: String?
+        var mainHead: String?
+        if let mainRoot {
+            mainBranch = await currentBranch(for: mainRoot)
+            mainHead = await (headID(for: mainRoot)).map { String($0.prefix(7)) }
+        }
+        let worktree = WorktreeDTO(
+            isWorktree: true,
+            worktreeName: layout.gitDir.lastPathComponent.isEmpty ? nil : layout.gitDir.lastPathComponent,
+            worktreeRoot: layout.workTreeRoot.path,
+            commonGitDir: layout.commonDir.path,
+            mainWorktreeRoot: mainRoot?.path,
+            worktreeBranch: worktreeBranch,
+            mainBranch: mainBranch,
+            worktreeHead: worktreeHead,
+            mainHead: mainHead
+        )
+        worktreesByPath[key] = worktree
+        return worktree
+    }
+
+    private func pathKey(_ url: URL) -> String {
+        url.standardizedFileURL.path.lowercased()
+    }
+}
+
+@MainActor
 final class MCPGitToolProvider: MCPWindowToolProviding {
     let group: MCPWindowToolGroup = .git
 
@@ -169,8 +312,8 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
         let metadata = await dependencies.captureRequestMetadata()
         let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
         let visibleRoots = await dependencies.promptVM.workspaceFileContextStore.rootRefs(scope: lookupContext.rootScope)
-        let allRepos = try await discoverAllGitRepos(rootScope: lookupContext.rootScope)
-        let defaultRepo = try await resolveDefaultGitRepo(rootScope: lookupContext.rootScope)
+        let requestContext = MCPGitRequestContext(rootRefs: visibleRoots, vcsService: vcsService)
+        let allRepos = await requestContext.allRepos()
         let explicitTokens = parseExplicitRepoRoots(from: args).map { tokens in
             tokens.map { token in
                 token.hasPrefix("@") ? token : lookupContext.translateInputPath(token)
@@ -187,6 +330,9 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
             }
             repos = [match]
         } else {
+            guard let defaultRepo = allRepos.first else {
+                throw MCPError.invalidParams("No VCS repository found in loaded roots.")
+            }
             let resolver = GitRepoTargetResolver()
             do {
                 repos = try await resolver.resolveRepoRoots(
@@ -206,9 +352,6 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
         let primaryRepo = repos[0]
         let repoURL = primaryRepo.rootURL
         let isMultiRepo = repos.count > 1
-        let primaryWorktree = await buildWorktreeDTO(for: repoURL)
-        let worktreeWarning = buildWorktreeWarning(from: primaryWorktree)
-
         // Helper: Build status breakdown from changed files
         func statusBreakdown(from files: [VCSUncommittedFile]) -> [String: Int]? {
             var counts: [String: Int] = [:]
@@ -291,43 +434,6 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
                 EditFlowPerf.Dimensions(fileBytes: patchBytes, lineCount: changedFiles.count, chunkCount: hunkCount)
             )
             return parsedFiles
-        }
-
-        func buildWorktreeDTO(for repoURL: URL) async -> Reply.WorktreeDTO? {
-            let backend = await vcsService.backend(forRepoRoot: repoURL)
-            guard backend.kind == .git else { return nil }
-            guard let layout = GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: repoURL), layout.isLinkedWorktree else { return nil }
-
-            let worktreeRoot = layout.workTreeRoot.path
-            let worktreeName = layout.gitDir.lastPathComponent.isEmpty ? nil : layout.gitDir.lastPathComponent
-            let commonGitDir = layout.commonDir.path
-            let listedMainRoot = try? await vcsService.listGitWorktrees(at: repoURL)
-                .first(where: \.isMain)
-                .map { URL(fileURLWithPath: $0.path).standardizedFileURL }
-            let mainRoot = listedMainRoot ?? GitRepoTargetResolver.resolveMainWorktreeRoot(for: layout)
-
-            let wtBranch = try? await backend.getCurrentBranch(at: repoURL)
-            let wtHead = await (try? backend.getHeadID(at: repoURL)).map { String($0.prefix(7)) }
-
-            var mainBranch: String?
-            var mainHead: String?
-            if let mainRoot {
-                let mainBackend = await vcsService.backend(forRepoRoot: mainRoot)
-                mainBranch = try? await mainBackend.getCurrentBranch(at: mainRoot)
-                mainHead = await (try? mainBackend.getHeadID(at: mainRoot)).map { String($0.prefix(7)) }
-            }
-
-            return Reply.WorktreeDTO(
-                isWorktree: true,
-                worktreeName: worktreeName,
-                worktreeRoot: worktreeRoot,
-                commonGitDir: commonGitDir,
-                mainWorktreeRoot: mainRoot?.path,
-                worktreeBranch: wtBranch,
-                mainBranch: mainBranch,
-                worktreeHead: wtHead,
-                mainHead: mainHead
-            )
         }
 
         func buildWorktreeWarning(from worktree: Reply.WorktreeDTO?) -> String? {
@@ -536,29 +642,6 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
             return true
         }
 
-        func detectMainBranchRef(repoURL: URL) async -> String? {
-            let backend = await vcsService.backend(forRepoRoot: repoURL)
-            let remoteBranches = await (try? backend.getRemoteBranches(at: repoURL, limit: 200).map(\.name)) ?? []
-            let localBranches = await (try? backend.getLocalBranches(at: repoURL, limit: 200).map(\.name)) ?? []
-
-            func pick(_ candidates: [String], in list: [String]) -> String? {
-                for candidate in candidates where list.contains(candidate) {
-                    return candidate
-                }
-                return nil
-            }
-
-            if let ref = pick(["origin/main", "upstream/main"], in: remoteBranches) { return ref }
-            if let ref = pick(["main"], in: localBranches) { return ref }
-            if let ref = pick(["origin/master", "upstream/master"], in: remoteBranches) { return ref }
-            if let ref = pick(["master"], in: localBranches) { return ref }
-            if let upstream = try? await backend.getUpstreamRef(at: repoURL), !upstream.isEmpty {
-                return upstream
-            }
-
-            return nil
-        }
-
         func resolveCompareSpec(_ compareRaw: String) async throws -> (spec: GitDiffCompareSpec, resolved: String, input: String?) {
             try await resolveCompareSpec(compareRaw, for: primaryRepo)
         }
@@ -569,7 +652,7 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
             let lowered = rawInput.lowercased()
 
             if lowered == "main" || lowered == "trunk" {
-                guard let mainRef = await detectMainBranchRef(repoURL: repo.rootURL) else {
+                guard let mainRef = await requestContext.mainBranchRef(for: repo.rootURL) else {
                     throw MCPError.invalidParams("compare=\"\(rawInput)\" could not be resolved. Try compare=\"origin/main\" or compare=\"mergebase:origin/main\".")
                 }
                 let spec = GitDiffCompareSpec.uncommittedMergeBase(base: mainRef)
@@ -583,7 +666,7 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
                     let base = parts[1].trimmingCharacters(in: .whitespacesAndNewlines)
                     let baseLowered = base.lowercased()
                     if baseLowered == "main" || baseLowered == "trunk" {
-                        guard let mainRef = await detectMainBranchRef(repoURL: repo.rootURL) else {
+                        guard let mainRef = await requestContext.mainBranchRef(for: repo.rootURL) else {
                             throw MCPError.invalidParams("compare=\"\(rawInput)\" could not be resolved. Try compare=\"\(mode):origin/main\".")
                         }
                         let spec: GitDiffCompareSpec = (mode == "staged") ? .stagedMergeBase(base: mainRef) : .uncommittedMergeBase(base: mainRef)
@@ -646,8 +729,8 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
                 var perRepoResults: [Reply.RepoResultDTO] = []
                 for repo in repos {
                     do {
-                        let backend = await vcsService.backend(forRepoRoot: repo.rootURL)
-                        let branch = try? await backend.getCurrentBranch(at: repo.rootURL)
+                        let backend = await requestContext.backend(for: repo.rootURL)
+                        let branch = await requestContext.currentBranch(for: repo.rootURL)
                         let upstream = try? await backend.getUpstreamRef(at: repo.rootURL)
                         var ahead: Int?
                         var behind: Int?
@@ -658,7 +741,7 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
                             }
                         }
                         let workingStatus = try await backend.getWorkingStatus(at: repo.rootURL)
-                        let repoWorktree = await buildWorktreeDTO(for: repo.rootURL)
+                        let repoWorktree = await requestContext.worktreeDTO(for: repo.rootURL)
                         let summaryStr: String = {
                             var parts: [String] = []
                             if let b = branch { parts.append(b) }
@@ -705,8 +788,8 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
             }
 
             // Single repo: legacy behavior
-            let backend = await vcsService.backend(forRepoRoot: repoURL)
-            let branch = try? await backend.getCurrentBranch(at: repoURL)
+            let backend = await requestContext.backend(for: repoURL)
+            let branch = await requestContext.currentBranch(for: repoURL)
             let upstream = try? await backend.getUpstreamRef(at: repoURL)
             var ahead: Int?
             var behind: Int?
@@ -717,6 +800,8 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
                 }
             }
             let workingStatus = try await backend.getWorkingStatus(at: repoURL)
+            let primaryWorktree = await requestContext.worktreeDTO(for: repoURL)
+            let worktreeWarning = buildWorktreeWarning(from: primaryWorktree)
             let summaryStr: String = {
                 var parts: [String] = []
                 if let b = branch { parts.append(b) }
@@ -759,7 +844,7 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
         case .log:
             let count = args["count"]?.intValue ?? 10
             let path = args["path"]?.stringValue.map { lookupContext.translateInputPath($0) }
-            let logBackend = await vcsService.backend(forRepoRoot: repoURL)
+            let logBackend = await requestContext.backend(for: repoURL)
             let commits = try await logBackend.getLogSummaries(count: count, path: path, at: repoURL)
             let commitDTOs = commits.map { c in
                 Reply.CommitSummaryDTO(
@@ -774,8 +859,9 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
                 )
             }
             // Warn if multiple repos detected but log only runs on primary
+            let primaryWorktree = await requestContext.worktreeDTO(for: repoURL)
             let logWarning: String? = isMultiRepo ? "Multiple repos detected; op 'log' ran against \(primaryRepo.displayName). Provide repo_root to target a specific repo." : nil
-            let combinedWarning = combineWarnings([logWarning, worktreeWarning])
+            let combinedWarning = combineWarnings([logWarning, buildWorktreeWarning(from: primaryWorktree)])
             return Reply(
                 op: "log",
                 status: nil,
@@ -797,7 +883,7 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
             let rawShowDetail = args["detail"]?.stringValue?.lowercased() ?? "summary"
             // For show, "patches" behaves the same as "full" (single commit, no truncation needed)
             let detail = rawShowDetail == "patches" ? "full" : rawShowDetail
-            let showBackend = await vcsService.backend(forRepoRoot: repoURL)
+            let showBackend = await requestContext.backend(for: repoURL)
             let commitInfo = try await showBackend.commitInfo(ref: ref, at: repoURL)
 
             // Get diff for this commit
@@ -866,8 +952,9 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
             }
 
             // Warn if multiple repos detected but show only runs on primary
+            let primaryWorktree = await requestContext.worktreeDTO(for: repoURL)
             let showWarning: String? = isMultiRepo ? "Multiple repos detected; op 'show' ran against \(primaryRepo.displayName). Provide repo_root to target a specific repo." : nil
-            let combinedWarning = combineWarnings([showWarning, worktreeWarning])
+            let combinedWarning = combineWarnings([showWarning, buildWorktreeWarning(from: primaryWorktree)])
             return Reply(
                 op: "show",
                 status: nil, diff: nil, log: nil,
@@ -919,9 +1006,9 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
                 blameWarning = "Multiple repos detected; op 'blame' ran against \(primaryRepo.displayName). Provide repo_root or absolute path to target a specific repo."
             }
 
-            let blameBackend = await vcsService.backend(forRepoRoot: targetRepoURL)
+            let blameBackend = await requestContext.backend(for: targetRepoURL)
             let blameLines = try await blameBackend.blame(path: path, lineRange: lineRange, at: targetRepoURL)
-            let blameWorktree = await buildWorktreeDTO(for: targetRepoURL)
+            let blameWorktree = await requestContext.worktreeDTO(for: targetRepoURL)
             let combinedWarning = combineWarnings([blameWarning, buildWorktreeWarning(from: blameWorktree)])
             let lineDTOs = blameLines.map { l in
                 Reply.BlameLineDTO(num: l.line, sha: l.id, author: l.author, date: l.dateISO, content: l.content)
@@ -995,6 +1082,7 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
                     var perRepoResults: [Reply.RepoResultDTO] = []
                     var collectedDiffs: [Reply.DiffDTO] = []
                     var manifestsBySnapshotDir: [String: GitDiffSnapshotManifest] = [:]
+                    var publishedSnapshotPaths: [String] = []
                     let tabID = dependencies.boundTabID(connectionID)
 
                     // Group selection paths by repo
@@ -1003,7 +1091,7 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
                     for repo in repos {
                         do {
                             let repoCompare = try await resolveCompareSpec(compareRaw, for: repo)
-                            let repoWorktree = await buildWorktreeDTO(for: repo.rootURL)
+                            let repoWorktree = await requestContext.worktreeDTO(for: repo.rootURL)
                             let repoSelectedPaths = scope == .selected ? (pathsByRepo[repo] ?? []) : []
                             if scope == .selected, repoSelectedPaths.isEmpty {
                                 perRepoResults.append(Reply.RepoResultDTO(
@@ -1033,6 +1121,7 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
                             let snapshotID = manifest.snapshotID
                             let snapshotDirURL = store.snapshotDir(workspaceDirectory: workspaceDirectory, repoKey: repo.repoKey, snapshotID: snapshotID)
                             let snapshotDirRel = store.snapshotRelativePath(repoKey: repo.repoKey, snapshotID: snapshotID)
+                            publishedSnapshotPaths.append(snapshotDirURL.path)
                             let summary = summaryDTO(summary: manifest.summary, files: manifest.files)
                             let emptyReason = GitDiffMapBuilder.emptyReason(
                                 summary: manifest.summary,
@@ -1089,7 +1178,12 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
                     }
 
                     await dependencies.ensureGitDataRootLoaded(workspace, workspaceManager)
-                    _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngress(rootScope: .visibleWorkspacePlusGitData)
+                    if let publishedSnapshotPath = publishedSnapshotPaths.first {
+                        _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngressForExplicitRequest(
+                            userPath: publishedSnapshotPath,
+                            fallbackScope: .visibleWorkspacePlusGitData
+                        )
+                    }
                     let primaryArtifactCandidates = perRepoResults.flatMap { repoResult -> [String] in
                         guard let snapshotDir = repoResult.snapshotDir,
                               let artifacts = repoResult.artifacts
@@ -1143,9 +1237,8 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
                 let compare = try await resolveCompareSpec(compareRaw)
 
                 // Get normalization warning (e.g., staged/unstaged degraded to uncommitted for jj)
-                let normalizedResult = await vcsService.normalizeCompareSpec(compare.spec, at: repoURL)
+                let normalizedResult = await requestContext.normalizeCompareSpec(compare.spec, at: repoURL)
                 let artifactDiffWarning = normalizedResult.warning
-                let combinedWarning = combineWarnings([artifactDiffWarning, worktreeWarning])
 
                 let tabID = dependencies.boundTabID(connectionID)
                 let manifest = try await publisher.publish(
@@ -1163,10 +1256,13 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
                     tabID: tabID
                 )
 
-                await dependencies.ensureGitDataRootLoaded(workspace, workspaceManager)
-                _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngress(rootScope: .visibleWorkspacePlusGitData)
                 let snapshotID = manifest.snapshotID
                 let snapshotDirURL = store.snapshotDir(workspaceDirectory: workspaceDirectory, repoKey: primaryRepo.repoKey, snapshotID: snapshotID)
+                await dependencies.ensureGitDataRootLoaded(workspace, workspaceManager)
+                _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngressForExplicitRequest(
+                    userPath: snapshotDirURL.path,
+                    fallbackScope: .visibleWorkspacePlusGitData
+                )
                 let snapshotDirRel = store.snapshotRelativePath(repoKey: primaryRepo.repoKey, snapshotID: snapshotID)
                 let artifacts = artifactsDTO(snapshotDirURL: snapshotDirURL, manifest: manifest)
                 let primaryArtifacts = GitDiffSnapshotStore.primaryArtifacts(
@@ -1175,6 +1271,8 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
                     allPatchRelativePath: artifacts.allPatch
                 )
                 let autoSelectedPrimaryArtifacts = await autoSelectPrimaryGitDiffArtifacts(paths: primaryArtifacts.selectionCandidates)
+                let primaryWorktree = await requestContext.worktreeDTO(for: repoURL)
+                let combinedWarning = combineWarnings([artifactDiffWarning, buildWorktreeWarning(from: primaryWorktree)])
                 let summary = summaryDTO(summary: manifest.summary, files: manifest.files)
                 let emptyReason = GitDiffMapBuilder.emptyReason(
                     summary: manifest.summary,
@@ -1232,7 +1330,7 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
                 for repo in repos {
                     do {
                         let repoCompare = try await resolveCompareSpec(compareRaw, for: repo)
-                        let repoWorktree = await buildWorktreeDTO(for: repo.rootURL)
+                        let repoWorktree = await requestContext.worktreeDTO(for: repo.rootURL)
 
                         let buildResult = try await engine.buildSnapshotInputs(
                             compare: repoCompare.spec,
@@ -1315,9 +1413,8 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
             let compare = try await resolveCompareSpec(compareRaw)
 
             // Get normalization warning (e.g., staged/unstaged degraded to uncommitted for jj)
-            let normalizedResult = await vcsService.normalizeCompareSpec(compare.spec, at: repoURL)
+            let normalizedResult = await requestContext.normalizeCompareSpec(compare.spec, at: repoURL)
             let diffWarning = normalizedResult.warning
-            let combinedWarning = combineWarnings([diffWarning, worktreeWarning])
 
             let buildResult = try await engine.buildSnapshotInputs(
                 compare: compare.spec,
@@ -1332,6 +1429,8 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
             let totalInsertions = buildResult.summary.insertions
             let totalDeletions = buildResult.summary.deletions
             let byStatus = statusBreakdown(from: buildResult.changedFiles)
+            let primaryWorktree = await requestContext.worktreeDTO(for: repoURL)
+            let combinedWarning = combineWarnings([diffWarning, buildWorktreeWarning(from: primaryWorktree)])
 
             var files: [Reply.DiffFileDTO]?
             var truncated: Bool?
@@ -1385,81 +1484,7 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
         }
     }
 
-    private func relativePath(from base: URL, to url: URL) -> String {
-        let basePath = (base.path as NSString).standardizingPath
-        let targetPath = (url.path as NSString).standardizingPath
-        if targetPath.hasPrefix(basePath) {
-            var rel = String(targetPath.dropFirst(basePath.count))
-            if rel.hasPrefix("/") { rel.removeFirst() }
-            return rel
-        }
-        return url.path
-    }
-
-    private func resolveGitRepoURL(preferredRootPath: String?) async throws -> URL {
-        let vcsService = VCSService.shared
-        var candidates: [String] = []
-        if let preferredRootPath, !preferredRootPath.isEmpty {
-            candidates.append(preferredRootPath)
-        }
-        let visibleRoots = await dependencies.promptVM.workspaceFileContextStore.rootRefs(scope: .visibleWorkspace).map(\.standardizedFullPath)
-        candidates.append(contentsOf: visibleRoots)
-        var seen = Set<String>()
-        for path in candidates {
-            let standardized = (path as NSString).standardizingPath
-            let key = standardized.lowercased()
-            guard seen.insert(key).inserted else { continue }
-            if let resolved = await vcsService.resolveRepo(from: URL(fileURLWithPath: standardized)) {
-                return resolved.rootURL
-            }
-        }
-        throw MCPError.invalidParams("No VCS repository found in loaded roots.")
-    }
-
     // MARK: - Multi-root git helpers
-
-    /// Discover all git repos from visible root folders.
-    /// - Returns: Array of GitRepoDescriptor for all discovered repos
-    private func discoverAllGitRepos(rootScope: WorkspaceLookupRootScope = .visibleWorkspace) async throws -> [GitRepoDescriptor] {
-        let vcsService = VCSService.shared
-        let visibleRoots = await dependencies.promptVM.workspaceFileContextStore.rootRefs(scope: rootScope)
-
-        var seenPaths = Set<String>()
-        var repos: [GitRepoDescriptor] = []
-
-        for folder in visibleRoots {
-            let standardized = folder.standardizedFullPath
-            let key = standardized.lowercased()
-            guard seenPaths.insert(key).inserted else { continue }
-
-            if let resolved = await vcsService.resolveRepo(from: URL(fileURLWithPath: standardized)) {
-                let repoPath = (resolved.rootURL.path as NSString).standardizingPath
-                let repoKey = repoPath.lowercased()
-                // Only add if we haven't seen this repo root yet
-                if !repos.contains(where: { $0.rootPath.lowercased() == repoKey }) {
-                    repos.append(GitRepoDescriptor(rootURL: resolved.rootURL))
-                }
-            }
-        }
-
-        return repos
-    }
-
-    /// Resolve the default git repo (first loaded root's repo).
-    /// - Returns: The first git repo found from visible roots in order
-    private func resolveDefaultGitRepo(rootScope: WorkspaceLookupRootScope = .visibleWorkspace) async throws -> GitRepoDescriptor {
-        let vcsService = VCSService.shared
-        let visibleRoots = await dependencies.promptVM.workspaceFileContextStore.rootRefs(scope: rootScope)
-        // Return the first visible root that is inside a VCS repo
-        for folder in visibleRoots {
-            let standardized = folder.standardizedFullPath
-            if let resolved = await vcsService.resolveRepo(from: URL(fileURLWithPath: standardized)) {
-                return GitRepoDescriptor(rootURL: resolved.rootURL)
-            }
-        }
-
-        throw MCPError.invalidParams("No VCS repository found in loaded roots.")
-    }
 
     /// Group absolute paths by their owning repo
     /// - Parameters:
