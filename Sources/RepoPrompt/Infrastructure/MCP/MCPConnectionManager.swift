@@ -5671,6 +5671,40 @@ actor ServerNetworkManager {
         )
     }
 
+    @MainActor
+    private static func finishReadFileAutoSelectionAndRemoveTabContext(
+        connectionID: UUID,
+        clientName: String?,
+        assignedWindowID: Int?
+    ) async {
+        let windows = WindowStatesManager.shared.allWindows
+        let targets: [WindowState]
+        let cleanupWindowID: Int?
+        if let assignedWindowID,
+           let assignedWindow = windows.first(where: { $0.windowID == assignedWindowID })
+        {
+            targets = [assignedWindow]
+            cleanupWindowID = assignedWindowID
+        } else {
+            targets = windows
+            cleanupWindowID = nil
+        }
+
+        for state in targets {
+            await state.mcpServer.finishReadFileAutoSelectionForConnectionTeardown(
+                connectionID: connectionID
+            )
+        }
+        for state in targets {
+            state.mcpServer.removeTabContext(
+                forConnectionID: connectionID,
+                clientName: clientName,
+                windowID: cleanupWindowID,
+                runID: nil
+            )
+        }
+    }
+
     func removeConnection(_ id: UUID) async {
         _ = await removeConnection(id, committedRemoval: nil, connectionAlreadyStopped: false)
     }
@@ -5767,29 +5801,11 @@ actor ServerNetworkManager {
             connectionLog("Cancelled \(cancelledToolCount) active tool execution(s) owned by disconnected connection \(id)")
         }
 
-        await MainActor.run {
-            let windows = WindowStatesManager.shared.allWindows
-            let nameForCleanup = cleanupClientName
-            if let windowID = assignedWindowID,
-               let windowState = windows.first(where: { $0.windowID == windowID })
-            {
-                windowState.mcpServer.removeTabContext(
-                    forConnectionID: id,
-                    clientName: nameForCleanup,
-                    windowID: windowID,
-                    runID: nil
-                )
-            } else {
-                for state in windows {
-                    state.mcpServer.removeTabContext(
-                        forConnectionID: id,
-                        clientName: nameForCleanup,
-                        windowID: nil,
-                        runID: nil
-                    )
-                }
-            }
-        }
+        await Self.finishReadFileAutoSelectionAndRemoveTabContext(
+            connectionID: id,
+            clientName: cleanupClientName,
+            assignedWindowID: assignedWindowID
+        )
         connectionWindowMap[id] = nil
 
         // Stop the connection manager unless the exact committed owner was already stopped

@@ -2496,6 +2496,13 @@ extension MCPServerViewModel {
     }
 
     @MainActor
+    func finishReadFileAutoSelectionForConnectionTeardown(connectionID: UUID) async {
+        guard let context = tabContextByConnectionID[connectionID] else { return }
+        let key = readFileAutoSelectionContextKey(connectionID: connectionID, context: context)
+        _ = await readFileAutoSelectionCoordinator.finish(context: key)
+    }
+
+    @MainActor
     func removeTabContext(
         forConnectionID connectionID: UUID?,
         clientName: String?,
