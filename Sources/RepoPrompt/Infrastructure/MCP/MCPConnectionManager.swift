@@ -978,8 +978,11 @@ actor ServerNetworkManager {
     }
 
     /// Same-process live reconnect affinity keyed by MCP client name + capability token.
-    /// This is never persisted and is only authoritative while the matching run policy
-    /// still exists in memory for the current app process.
+    /// The capability token identifies the `repoprompt-mcp` helper process, not a logical
+    /// Agent session. External MCP/ACP runtimes own helper lifetime and may retain one helper
+    /// while opening a child session, so an exact reserved PID-owned route can supersede this
+    /// reconnect fallback. This is never persisted and is only usable while the matching run
+    /// policy still exists in memory for the current app process.
     private struct LiveRunAffinity {
         let windowID: Int
         let runID: UUID
@@ -6653,7 +6656,8 @@ actor ServerNetworkManager {
             bootstrapClientName: String? = nil,
             sessionKey: String? = nil,
             pidGateTimeout: TimeInterval = 0.25,
-            requireRunRouting: Bool = true
+            requireRunRouting: Bool = true,
+            expectedLifecycleGeneration: UInt64? = nil
         ) async -> (restrictedTools: Set<String>, additionalTools: Set<String>, purpose: MCPRunPurpose, windowID: Int?, outcome: String, runID: UUID?) {
             pendingConnections[connectionID] = clientName
             if let sessionKey {
@@ -6665,7 +6669,8 @@ actor ServerNetworkManager {
                 clientPid: clientPid,
                 bootstrapClientName: bootstrapClientName,
                 pidGateTimeout: pidGateTimeout,
-                requireRunRouting: requireRunRouting
+                requireRunRouting: requireRunRouting,
+                expectedLifecycleGeneration: expectedLifecycleGeneration
             )
             let state = debugConnectionPolicyState(for: connectionID)
             let outcomeDescription: String
@@ -8929,15 +8934,37 @@ actor ServerNetworkManager {
         return isExpectedAgentDescendant(clientName: clientName, clientPid: clientPid, runID: policy.runID) == true
     }
 
-    private func canReplaceLiveRunAffinity(with policy: ClientConnectionPolicy) -> Bool {
+    /// Returns whether a pending route has enough current ownership evidence to override
+    /// process-token reconnect affinity. Role/tool profile is intentionally irrelevant here.
+    /// The policy must already be reserved by this connection and still be the current queued
+    /// policy, while the peer PID and connection lifecycle independently prove ownership.
+    private func isAuthoritativePIDOwnedAgentModeRoute(
+        _ policy: ClientConnectionPolicy,
+        key: String,
+        clientName: String,
+        clientPid: Int?,
+        connectionID: UUID,
+        expectedLifecycleGeneration: UInt64?
+    ) -> Bool {
         guard policy.oneShot,
               policy.purpose == .agentModeRun,
+              policy.runID != nil,
+              policy.tabID != nil,
               policy.requiresExpectedAgentPID,
-              policy.tabID != nil
+              policy.reservationConnectionID == connectionID,
+              canConsumePendingPolicy(policy, clientName: clientName, clientPid: clientPid),
+              isPendingPolicyApplicationCurrent(
+                  connectionID: connectionID,
+                  clientName: clientName,
+                  expectedLifecycleGeneration: expectedLifecycleGeneration
+              ),
+              pendingPoliciesByClient[key]?.contains(where: {
+                  $0.id == policy.id && $0.reservationConnectionID == connectionID
+              }) == true
         else {
             return false
         }
-        return policy.taskLabelKind == .engineer || policy.taskLabelKind == .pair
+        return true
     }
 
     private func oldestReservedPendingPolicyEntry(
@@ -9179,25 +9206,7 @@ actor ServerNetworkManager {
             return .fallback
         }
         let sessionKey = connections[connectionID]?.capabilityToken ?? capabilityTokenByConnection[connectionID]
-        if let policyRunID = matchedQueueEntry.policy.runID,
-           let affinity = preferredLiveRunAffinity(for: clientName, sessionKey: sessionKey),
-           affinity.runID != policyRunID,
-           !canReplaceLiveRunAffinity(with: matchedQueueEntry.policy)
-        {
-            #if DEBUG
-                debugRecordRunRoutingEvent(
-                    runID: policyRunID,
-                    event: "policy_rejected",
-                    connectionID: connectionID,
-                    fields: [
-                        "client_name": clientName,
-                        "reason": "session_token_bound_to_other_run",
-                        "bound_run_id": affinity.runID.uuidString
-                    ]
-                )
-            #endif
-            return .rejected(runID: policyRunID, reason: "session_token_bound_to_other_run")
-        }
+        let liveAffinity = preferredLiveRunAffinity(for: clientName, sessionKey: sessionKey)
         var queue = pendingPoliciesByClient[matchedQueueEntry.key] ?? []
         mcpRoutingLog("Applying FIFO policy client=\(clientName) matchedKey=\(matchedQueueEntry.key) connectionID=\(connectionID) queueLength=\(queue.count) policyWindow=\(matchedQueueEntry.policy.windowID)")
         let policy: ClientConnectionPolicy
@@ -9216,6 +9225,40 @@ actor ServerNetworkManager {
             queue.append(policy)
             remainingAfterRequeue = queue.count
             pendingPoliciesByClient[matchedQueueEntry.key] = queue
+        }
+
+        if let policyRunID = policy.runID,
+           let liveAffinity,
+           liveAffinity.runID != policyRunID,
+           !isAuthoritativePIDOwnedAgentModeRoute(
+               policy,
+               key: matchedQueueEntry.key,
+               clientName: clientName,
+               clientPid: clientPid,
+               connectionID: connectionID,
+               expectedLifecycleGeneration: expectedLifecycleGeneration
+           )
+        {
+            if policy.oneShot {
+                _ = rollbackOneShotPendingPolicyReservation(
+                    id: policy.id,
+                    key: matchedQueueEntry.key,
+                    connectionID: connectionID
+                )
+            }
+            #if DEBUG
+                debugRecordRunRoutingEvent(
+                    runID: policyRunID,
+                    event: "policy_rejected",
+                    connectionID: connectionID,
+                    fields: [
+                        "client_name": clientName,
+                        "reason": "session_token_bound_to_other_run",
+                        "bound_run_id": liveAffinity.runID.uuidString
+                    ]
+                )
+            #endif
+            return .rejected(runID: policyRunID, reason: "session_token_bound_to_other_run")
         }
 
         let restorePoint = PendingPolicyRestorePoint(

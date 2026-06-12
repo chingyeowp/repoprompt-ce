@@ -938,8 +938,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         static let tabID = UUID(uuidString: "22222222-2222-4222-8222-222222222222")!
         static let gateID = UUID(uuidString: "33333333-3333-4333-8333-333333333333")!
         static let connectionID = UUID(uuidString: "44444444-4444-4444-8444-444444444444")!
-        static let priorRunID = UUID(uuidString: "55555555-5555-4555-8555-555555555555")!
-        static let priorConnectionID = UUID(uuidString: "66666666-6666-4666-8666-666666666666")!
+        static let parentRunID = UUID(uuidString: "55555555-5555-4555-8555-555555555555")!
+        static let parentConnectionID = UUID(uuidString: "66666666-6666-4666-8666-666666666666")!
         static let agentSessionID = UUID(uuidString: "77777777-7777-4777-8777-777777777777")!
         static let sessionToken = "persistent-agent-mode-read-file-checkpoint-session"
         static let sentinelContent = """
@@ -1101,12 +1101,16 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     sessionToken: sessionToken
                 )
                 if agentOwned {
+                    // MCP capability tokens are helper-process identities. This synthetic
+                    // fixture models the confirmed provider behavior of retaining the parent's
+                    // helper while opening a child session; it does not claim agent_run copies
+                    // tokens or replace separate live rpce-cli-debug validation.
                     await ServerNetworkManager.shared.installClientConnectionPolicy(
                         for: AgentProviderKind.codexMCPClientID,
                         windowID: window.windowID,
                         restrictedTools: AgentModeMCPToolPolicy.restrictedTools,
                         tabID: nil,
-                        runID: priorRunID,
+                        runID: parentRunID,
                         additionalTools: AgentModeMCPPolicyInstaller.additionalTools(for: .codexExec),
                         purpose: .agentModeRun,
                         requiresExpectedAgentPID: true
@@ -1114,23 +1118,23 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     await ServerNetworkManager.shared.registerExpectedAgentPID(
                         getpid(),
                         for: AgentProviderKind.codexMCPClientID,
-                        runID: priorRunID
+                        runID: parentRunID
                     )
-                    let priorApplication = await ServerNetworkManager.shared.debugApplyPendingPolicy(
+                    let parentApplication = await ServerNetworkManager.shared.debugApplyPendingPolicy(
                         clientName: AgentProviderKind.codexMCPClientID,
-                        connectionID: priorConnectionID,
+                        connectionID: parentConnectionID,
                         clientPid: Int(getpid()),
                         bootstrapClientName: AgentProviderKind.codexMCPClientID,
                         sessionKey: sessionToken,
                         requireRunRouting: false
                     )
-                    guard priorApplication.outcome == "applied", priorApplication.runID == priorRunID else {
-                        throw ClientFixtureError.priorAffinitySeedFailed(priorApplication.outcome)
+                    guard parentApplication.outcome == "applied", parentApplication.runID == parentRunID else {
+                        throw ClientFixtureError.parentAffinitySeedFailed(parentApplication.outcome)
                     }
                     await ServerNetworkManager.shared.clearExpectedAgentPID(
                         getpid(),
                         for: AgentProviderKind.codexMCPClientID,
-                        runID: priorRunID
+                        runID: parentRunID
                     )
                 }
 
@@ -1183,14 +1187,14 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 )
                 await ServerNetworkManager.shared.cleanupRunRoutingState(for: runID, windowID: window.windowID)
                 if agentOwned {
-                    await ServerNetworkManager.shared.removeConnection(priorConnectionID)
+                    await ServerNetworkManager.shared.removeConnection(parentConnectionID)
                     await ServerNetworkManager.shared.clearClientConnectionPolicy(
                         for: AgentProviderKind.codexMCPClientID,
                         windowID: window.windowID,
-                        runID: priorRunID
+                        runID: parentRunID
                     )
                     await ServerNetworkManager.shared.cleanupRunRoutingState(
-                        for: priorRunID,
+                        for: parentRunID,
                         windowID: window.windowID
                     )
                 }
@@ -1277,13 +1281,13 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             )
             await networkManager.cleanupRunRoutingState(for: Self.runID, windowID: windowID)
             if agentOwned {
-                await networkManager.removeConnection(Self.priorConnectionID)
+                await networkManager.removeConnection(Self.parentConnectionID)
                 await networkManager.clearClientConnectionPolicy(
                     for: AgentProviderKind.codexMCPClientID,
                     windowID: windowID,
-                    runID: Self.priorRunID
+                    runID: Self.parentRunID
                 )
-                await networkManager.cleanupRunRoutingState(for: Self.priorRunID, windowID: windowID)
+                await networkManager.cleanupRunRoutingState(for: Self.parentRunID, windowID: windowID)
             }
             await lease.cancelAndCleanup()
             window.mcpServer.removeTabContext(
@@ -1303,7 +1307,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
     private enum ClientFixtureError: Error {
         case exactAbsoluteCatalogMiss
         case leaseAcquisitionFailed
-        case priorAffinitySeedFailed(String)
+        case parentAffinitySeedFailed(String)
     }
 
     private struct RetainedConnectionSnapshot: Equatable {
