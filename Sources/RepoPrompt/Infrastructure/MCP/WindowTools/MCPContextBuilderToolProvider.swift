@@ -212,16 +212,17 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
             )
         }
 
-        let capturedOracleExportDestination: OracleExportDestination? = if exportResponse {
+        let capturedOracleExportDestination: OracleExportDestination?
+        if exportResponse {
             let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
-            try dependencies.makeOracleExportDestination(
+            capturedOracleExportDestination = try dependencies.makeOracleExportDestination(
                 workspace,
                 targetWindow.windowID,
                 finalTabID,
                 lookupContext
             )
         } else {
-            nil
+            capturedOracleExportDestination = nil
         }
 
         let contextBuilderVM = targetWindow.contextBuilderAgentViewModel
