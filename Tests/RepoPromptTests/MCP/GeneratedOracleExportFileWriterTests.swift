@@ -55,6 +55,7 @@ final class GeneratedOracleExportFileWriterTests: XCTestCase {
         }
     }
 
+    @MainActor
     func testBoundGeneratedExportUsesWorktreeRootAndIsReadableThroughSameLookupContext() async throws {
         let logicalRoot = try makeTemporaryRoot(name: "OracleExportBoundLogical")
         let worktreeRoot = try makeTemporaryRoot(name: "OracleExportBoundWorktree")
