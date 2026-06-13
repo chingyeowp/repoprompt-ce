@@ -83,7 +83,7 @@ import XCTest
                         )
                     }
                     fixture.contextA.window.mcpServer.setContextBuilderFollowUpOverrideForTesting {
-                        _, tabID, mode, prompt, selection, lookupContext in
+                        _, tabID, mode, prompt, selection, lookupContext, _, _ in
                         let message = await fixture.contextA.window.promptManager.buildHeadlessAIMessage(
                             from: HeadlessContextSnapshot(
                                 tabID: tabID,
@@ -316,6 +316,10 @@ import XCTest
                     try write(
                         "struct \(canonicalSentinel) { func canonicalMethod() {} }\n",
                         to: fixture.contextA.fileURL
+                    )
+                    await fixture.contextA.window.workspaceFileContextStore.replayObservedFileSystemDeltas(
+                        rootID: fixture.contextA.rootID,
+                        deltas: [.fileModified("Sources/\(fixture.contextA.fileURL.lastPathComponent)", Date())]
                     )
                     factory.configure(
                         networkManager: fixture.networkManager,

@@ -9,7 +9,6 @@ import XCTest
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(lease: lease)
                 let gate = OracleWorktreeGate()
-                let drainSignal = OracleWorktreeSignal()
                 let capture = OracleWorktreeCapture()
                 do {
                     try await activateWorkspace(fixture.contextA)
@@ -36,9 +35,6 @@ import XCTest
                     let endpoint = try fixture.endpointA()
                     try await configureAgentModeEndpoint(endpoint, context: context, fixture: fixture)
                     installOracleCapture(capture, on: fixture.contextA.window)
-                    fixture.contextA.window.mcpServer.setOracleReadAutoSelectionDrainObserverForTesting {
-                        drainSignal.markStarted()
-                    }
                     fixture.contextA.window.mcpServer.setReadFileAutoSelectionCanonicalApplyGateForTesting {
                         await gate.markStartedAndWaitForRelease()
                     }
@@ -61,7 +57,11 @@ import XCTest
                             timeoutSeconds: 30
                         )
                     }
-                    await drainSignal.waitUntilStarted()
+                    let drainWaiterRegistered = await waitUntil {
+                        fixture.contextA.window.mcpServer
+                            .readFileAutoSelectionDiagnosticsSnapshot().canonicalWaiterCount == 1
+                    }
+                    XCTAssertTrue(drainWaiterRegistered)
                     XCTAssertFalse(capture.wasInvoked)
 
                     await gate.release()
@@ -77,13 +77,11 @@ import XCTest
                     XCTAssertFalse(capture.fileTree.contains(worktreeRoot.path), capture.fileTree)
 
                     fixture.contextA.window.mcpServer.setReadFileAutoSelectionCanonicalApplyGateForTesting(nil)
-                    fixture.contextA.window.mcpServer.setOracleReadAutoSelectionDrainObserverForTesting(nil)
                     fixture.contextA.window.mcpServer.setOracleChatSendOverrideForTesting(nil)
                     await fixture.cleanup()
                 } catch {
                     await gate.release()
                     fixture.contextA.window.mcpServer.setReadFileAutoSelectionCanonicalApplyGateForTesting(nil)
-                    fixture.contextA.window.mcpServer.setOracleReadAutoSelectionDrainObserverForTesting(nil)
                     fixture.contextA.window.mcpServer.setOracleChatSendOverrideForTesting(nil)
                     await fixture.cleanup()
                     throw error
@@ -454,6 +452,21 @@ import XCTest
             )
             try content.write(to: url, atomically: true, encoding: .utf8)
         }
+
+        private func waitUntil(
+            timeout: Duration = .seconds(2),
+            condition: @MainActor () -> Bool
+        ) async -> Bool {
+            let clock = ContinuousClock()
+            let deadline = clock.now.advanced(by: timeout)
+            while clock.now < deadline {
+                if condition() {
+                    return true
+                }
+                try? await Task.sleep(for: .milliseconds(1))
+            }
+            return condition()
+        }
     }
 
     @MainActor
@@ -472,29 +485,6 @@ import XCTest
             self.tabContext = tabContext
             self.fileTree = fileTree
             self.fileBlocks = fileBlocks
-        }
-    }
-
-    @MainActor
-    private final class OracleWorktreeSignal {
-        private var started = false
-        private var waiters: [CheckedContinuation<Void, Never>] = []
-
-        func markStarted() {
-            guard !started else { return }
-            started = true
-            let pending = waiters
-            waiters.removeAll()
-            for waiter in pending {
-                waiter.resume()
-            }
-        }
-
-        func waitUntilStarted() async {
-            guard !started else { return }
-            await withCheckedContinuation { continuation in
-                waiters.append(continuation)
-            }
         }
     }
 

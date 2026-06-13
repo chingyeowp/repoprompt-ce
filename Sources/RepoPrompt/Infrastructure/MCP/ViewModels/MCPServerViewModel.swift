@@ -197,7 +197,6 @@ final class MCPServerViewModel: ObservableObject {
 
     #if DEBUG
         private var oracleChatSendOverrideForTesting: MCPOracleToolService.SendChat?
-        private var oracleReadAutoSelectionDrainObserverForTesting: (() -> Void)?
         private var contextBuilderFollowUpOverrideForTesting: MCPWindowToolDependencies.RunMCPPlanOrQuestion?
         private var contextBuilderSelectionReplyObserverForTesting: ((
             StoredSelection,
@@ -207,10 +206,6 @@ final class MCPServerViewModel: ObservableObject {
 
         func setOracleChatSendOverrideForTesting(_ override: MCPOracleToolService.SendChat?) {
             oracleChatSendOverrideForTesting = override
-        }
-
-        func setOracleReadAutoSelectionDrainObserverForTesting(_ observer: (() -> Void)?) {
-            oracleReadAutoSelectionDrainObserverForTesting = observer
         }
 
         func setContextBuilderFollowUpOverrideForTesting(
@@ -704,7 +699,16 @@ final class MCPServerViewModel: ObservableObject {
             guard let self else { throw MCPError.internalError("Window deallocated while generating context_builder response") }
             #if DEBUG
                 if let override = contextBuilderFollowUpOverrideForTesting {
-                    return try await override(contextBuilderVM, tabID, mode, prompt, selection, lookupContext)
+                    return try await override(
+                        contextBuilderVM,
+                        tabID,
+                        mode,
+                        prompt,
+                        selection,
+                        lookupContext,
+                        progressReporter,
+                        activityReporter
+                    )
                 }
             #endif
             return try await contextBuilderVM.runMCPPlanOrQuestion(
@@ -2827,11 +2831,10 @@ final class MCPServerViewModel: ObservableObject {
                 workspaceContext = nil
             }
 
-            let lookupContext: WorkspaceLookupContext
-            if let workspaceContext {
-                lookupContext = workspaceContext.lookupContext
+            let lookupContext: WorkspaceLookupContext = if let workspaceContext {
+                workspaceContext.lookupContext
             } else {
-                lookupContext = try await targetWindow.mcpServer.resolveFileToolLookupContext(
+                try await targetWindow.mcpServer.resolveFileToolLookupContext(
                     tabID: context.tabID,
                     workspaceID: context.workspaceID
                 )
@@ -3275,7 +3278,14 @@ final class MCPServerViewModel: ObservableObject {
             windowID: key.windowID
         )
         let lookupRootScope = await resolveFileToolLookupContext(from: metadata).rootScope
-        let initialSelection = context.selection
+        guard let workspaceID = key.workspaceID,
+              let initialSelection = workspaceManager?.composeTab(
+                  for: WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: key.tabID)
+              )?.selection
+        else { return .unchanged }
+        // The bound tab context is a routable working snapshot, not canonical selection authority.
+        // Handoffs and delayed mirrors can leave it behind the stored compose-tab selection, so
+        // every additive read/search batch must rebase on the latest canonical value.
         var selection = initialSelection
 
         if !batch.fullPaths.isEmpty {
