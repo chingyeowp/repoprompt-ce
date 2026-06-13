@@ -1308,7 +1308,8 @@ final class AgentModeViewModel: ObservableObject {
                 approvalPolicyProvider: { permissionProfile.codexApprovalPolicy },
                 sandboxModeProvider: { permissionProfile.codexSandboxMode },
                 approvalReviewerProvider: { permissionProfile.codexApprovalReviewer },
-                shellToolEnabled: nil,
+                shellToolEnabled: permissionProfile.codexBashToolEnabled(),
+                suppressThirdPartyMCPServers: permissionProfile.codexSuppressesThirdPartyMCPServers,
                 goalSupportEnabledProvider: { CodexGoalSupport.isEnabled },
                 computerUseEnabledProvider: { computerUseEnabled }
             )
